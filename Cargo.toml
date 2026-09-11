@@ -10,3 +10,11 @@ license = "MIT"
 [workspace.dependencies]
 r3 = { path = "crates/r3" }
 magictile-core = { path = "crates/magictile-core" }
+
+# Interactive rendering is unusable unoptimised (wgpu especially), so debug builds optimise
+# dependencies fully and our own code lightly. Debugging still works; release is still faster.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

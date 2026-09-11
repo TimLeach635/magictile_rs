@@ -26,12 +26,27 @@ const LINE_COLOR: Color32 = Color32::from_rgb(0, 0, 255);
 const LINE_WIDTH: f64 = 0.0125;
 /// Faces smaller than this many pixels across aren't drawn.
 const MIN_FACE_PX: f64 = 0.6;
+/// Lines thinner than this many pixels aren't drawn.
+const MIN_LINE_PX: f64 = 0.3;
+/// Chords approximating curved edges stay within about this many pixels of the true edge.
+const MAX_SAG_PX: f64 = 0.15;
 
 /// A face of the truncated tiling, in the Poincaré disk.
 struct Face {
     center: Vector3D,
     vertices: Vec<Vector3D>,
+    /// The hyperbolic midpoint of the edge from each vertex to the next.
+    midpoints: Vec<Vector3D>,
     color: Color32,
+    /// Hyperbolic distance from the center to the vertices.
+    radius: f64,
+}
+
+/// A line between two 2p-gons, in the Poincaré disk.
+struct Line {
+    a: Vector3D,
+    b: Vector3D,
+    mid: Vector3D,
 }
 
 /// The truncated tiling t{p,q}, generated around the origin.
@@ -40,11 +55,22 @@ pub struct TruncatedTiling {
     pub q: i32,
     faces: Vec<Face>,
     /// Edges between two 2p-gons (along the original tiling's edges).
-    lines: Vec<(Vector3D, Vector3D)>,
+    lines: Vec<Line>,
     /// For each tile of the original tiling: its center, and the symmetry taking it home.
     homes: Vec<(Vector3D, Isometry)>,
     /// The starting view: centered on a q-gon, with a corner pointing right.
     pub start: Isometry,
+    /// Edges shorter than this many pixels can't bend by more than [`MAX_SAG_PX`], so are drawn
+    /// as single chords.
+    short_edge_px: f64,
+}
+
+/// How the tiling maps to the screen this frame.
+struct Screen {
+    model: Model,
+    /// World units per pixel.
+    pixel: f64,
+    short_edge_px: f64,
 }
 
 impl TruncatedTiling {
@@ -79,7 +105,7 @@ impl TruncatedTiling {
             let n = vs.len();
             let vertices =
                 (0..n).flat_map(|i| [towards(vs[i], vs[(i + 1) % n], d), towards(vs[(i + 1) % n], vs[i], d)]).collect();
-            faces.push(Face { center: tile.center(), vertices, color: BIG_COLOR });
+            faces.push(Face::new(tile.center(), vertices, BIG_COLOR));
         }
         // The q-gons, one per vertex with all its tiles present.
         for (&v, tiles) in tiling.vertex_incidences.iter() {
@@ -106,7 +132,7 @@ impl TruncatedTiling {
             // Order them around the vertex.
             let angle = |c: &Vector3D| to_origin(v.to_complex(), c.to_complex()).phase();
             corners.sort_by(|a, b| angle(a).total_cmp(&angle(b)));
-            faces.push(Face { center: v, vertices: corners, color: SMALL_COLOR });
+            faces.push(Face::new(v, corners, SMALL_COLOR));
         }
 
         // The lines between 2p-gons: the middle parts of the original edges.
@@ -118,7 +144,8 @@ impl TruncatedTiling {
             else {
                 continue;
             };
-            lines.push((towards(seg.p1, seg.p2, d), towards(seg.p2, seg.p1, d)));
+            let (a, b) = (towards(seg.p1, seg.p2, d), towards(seg.p2, seg.p1, d));
+            lines.push(Line { a, b, mid: midpoint(a, b) });
         }
 
         let homes = tiling.tiles.iter().map(|t| (t.center(), t.isometry.clone())).collect();
@@ -129,11 +156,20 @@ impl TruncatedTiling {
         let phi = -to_origin(v, towards(base[0], base[1], d).to_complex()).phase();
         let turn = Complex::from_polar(1.0, phi);
         let start = Isometry::new(Mobius::new(turn, turn * v * -1.0, v.conj() * -1.0, Complex::ONE), None);
-        Ok(TruncatedTiling { p, q, faces, lines, homes, start })
+        // A geodesic segment bends most relative to its length at the top of a semicircle in the
+        // upper half-plane (which the disk looks like near its edge). There, a segment of length
+        // e spans ±θ with sin θ = tanh(e/2), and sags by tan(θ/2)/2 of its chord.
+        let theta = ((edge - 2.0 * d) / 2.0).tanh().asin();
+        let sag_ratio = (theta / 2.0).tan() / 2.0;
+        let short_edge_px = MAX_SAG_PX / (1.25 * sag_ratio);
+        Ok(TruncatedTiling { p, q, faces, lines, homes, start, short_edge_px })
     }
 
     /// Builds the frame's draw list. Also returns a symmetry recentering the view (see
     /// [`View::recenter`]), if the home tile has drifted away from the center.
+    ///
+    /// Everything goes into two batched draws (faces, then lines), so the GPU sees a handful of
+    /// commands however many faces are visible.
     fn draw(&self, view: &View, model: Model, pixels_per_point: f32) -> (DrawList, Option<Isometry>) {
         let camera = Camera::view(view.width, view.height, view.view_scale, view.rotation);
         let pixel = 2.0 * view.view_scale / (view.height as f64 * pixels_per_point as f64);
@@ -141,44 +177,129 @@ impl TruncatedTiling {
         // The far reaches of the tiling (beyond what we generate) are mostly 2p-gon.
         scene::fill_hyperbolic_plane(&mut list, model, BIG_COLOR);
 
-        let to_disk = |v: Vector3D| view.isometry.apply(v);
-        let f = |v: Vector3D| model.apply(v);
+        let screen = Screen { model, pixel, short_edge_px: self.short_edge_px };
+        let start = list.solid.len() as u32;
+        let mut scratch = Scratch::default();
         for face in &self.faces {
-            let disk: Vec<Vector3D> = face.vertices.iter().map(|&v| to_disk(v)).collect();
-            let screen: Vec<Vector3D> = disk.iter().map(|&v| f(v)).collect();
-            let size = screen.iter().map(|v| v.dist(screen[0])).fold(0.0, f64::max) / pixel;
-            if size < MIN_FACE_PX || screen.iter().any(|v| v.is_dne()) {
-                continue;
+            if let Some(center) = face.ring(&view.isometry, &screen, &mut scratch) {
+                list.convex_fan(center, &scratch.ring, face.color);
             }
-            let mut points = Vec::new();
-            for i in 0..disk.len() {
-                let j = (i + 1) % disk.len();
-                let n = (screen[i].dist(screen[j]) / pixel / 4.0).ceil().clamp(1.0, 32.0) as usize;
-                points.extend(geodesic(disk[i], disk[j], n).into_iter().take(n).map(f));
-            }
-            points.push(points[0]);
-            list.fill(f(to_disk(face.center)), &points, false, face.color, false);
         }
+        list.push_solid(start..list.solid.len() as u32, false);
 
-        for &(a, b) in &self.lines {
-            let (a, b) = (to_disk(a), to_disk(b));
-            let mid = to_disk_midpoint(a, b);
+        let start = list.solid.len() as u32;
+        for line in &self.lines {
             // Lines shrink with everything else towards the edge of the disk.
+            let mid = view.isometry.apply(line.mid);
             let width = LINE_WIDTH * (1.0 - mid.abs().powi(2)) / pixel;
-            if width < 0.3 {
+            if width < MIN_LINE_PX {
                 continue;
             }
-            let length = f(a).dist(f(b)) / pixel;
-            let n = (length / 4.0).ceil().clamp(1.0, 32.0) as usize;
-            let points: Vec<Vector3D> = geodesic(a, b, n).into_iter().map(f).collect();
-            list.polyline(&points, width, LINE_COLOR, false);
+            let (a, b) = (view.isometry.apply(line.a), view.isometry.apply(line.b));
+            scratch.ring.clear();
+            edge_points(a, b, || mid, &screen, &mut scratch.ring);
+            scratch.ring.push(model.apply(b));
+            list.polyline_triangles(&scratch.ring, width, LINE_COLOR);
         }
+        list.push_solid(start..list.solid.len() as u32, false);
 
-        let closest = (0..self.homes.len())
-            .min_by(|&a, &b| to_disk(self.homes[a].0).abs().total_cmp(&to_disk(self.homes[b].0).abs()));
+        let closest = (0..self.homes.len()).min_by(|&a, &b| {
+            view.isometry.apply(self.homes[a].0).abs().total_cmp(&view.isometry.apply(self.homes[b].0).abs())
+        });
         let recenter = closest.filter(|&i| i != 0).map(|i| self.homes[i].1.inverse());
         (list, recenter)
     }
+}
+
+/// Buffers reused from face to face.
+#[derive(Default)]
+struct Scratch {
+    disk: Vec<Vector3D>,
+    projected: Vec<Vector3D>,
+    ring: Vec<Vector3D>,
+}
+
+impl Face {
+    fn new(center: Vector3D, vertices: Vec<Vector3D>, color: Color32) -> Face {
+        let radius = vertices.iter().map(|&v| distance(center, v)).fold(0.0, f64::max);
+        let n = vertices.len();
+        let midpoints = (0..n).map(|i| midpoint(vertices[i], vertices[(i + 1) % n])).collect();
+        Face { center, vertices, midpoints, color, radius }
+    }
+
+    /// The face as it appears on screen: returns its center and leaves its closed boundary
+    /// (curved edges as chords) in `scratch.ring`, or returns `None` if it's too small to see.
+    ///
+    /// Faces are convex hyperbolic polygons, so a fan of flat triangles from the center covers
+    /// them exactly: neighboring triangles share their straight inner edges, and the boundary is
+    /// sampled finely enough that the chords are within a fraction of a pixel of the true edges.
+    fn ring(&self, view: &Isometry, screen: &Screen, scratch: &mut Scratch) -> Option<Vector3D> {
+        let (model, pixel) = (screen.model, screen.pixel);
+        let center = view.apply(self.center);
+
+        // Cheap cull first: the disk model's size of a hyperbolic disk of our radius around the
+        // center, generously scaled for models that can magnify (up to 2x for Klein).
+        let magnification = match model {
+            Model::Plain => Some(1.0),
+            Model::Hyperbolic(HyperbolicModel::Klein) => Some(2.0),
+            _ => None,
+        };
+        if let Some(m) = magnification {
+            let (r2, t) = (center.abs().powi(2), (self.radius / 2.0).tanh());
+            let diameter = 2.0 * m * t * (1.0 - r2) / (1.0 - t * t * r2);
+            if diameter / pixel < MIN_FACE_PX {
+                return None;
+            }
+        }
+
+        let Scratch { disk, projected, ring } = scratch;
+        disk.clear();
+        disk.extend(self.vertices.iter().map(|&v| view.apply(v)));
+        projected.clear();
+        projected.extend(disk.iter().map(|&v| model.apply(v)));
+        let size = projected.iter().map(|v| v.dist(projected[0])).fold(0.0, f64::max) / pixel;
+        if size < MIN_FACE_PX || projected.iter().any(|v| v.is_dne()) {
+            return None;
+        }
+        ring.clear();
+        for i in 0..disk.len() {
+            let j = (i + 1) % disk.len();
+            edge_points(disk[i], disk[j], || view.apply(self.midpoints[i]), screen, ring);
+        }
+        ring.push(projected[0]);
+        Some(model.apply(center))
+    }
+}
+
+/// Appends the on-screen points of the edge from `a` to `b` (in the disk, with hyperbolic
+/// midpoint `mid`), leaving off `b`. Uses as few chords as keep within [`MAX_SAG_PX`] of the curve,
+/// and samples the same points whichever way round the edge is given, so neighboring faces meet
+/// exactly.
+fn edge_points(a: Vector3D, b: Vector3D, mid: impl FnOnce() -> Vector3D, screen: &Screen, out: &mut Vec<Vector3D>) {
+    let (model, pixel) = (screen.model, screen.pixel);
+    let (fa, fb) = (model.apply(a), model.apply(b));
+    out.push(fa);
+    // Edges this short can't bend visibly, so skip finding the midpoint.
+    if fa.dist(fb) / pixel < screen.short_edge_px {
+        return;
+    }
+    // A chord's distance from the arc drops with the square of the number of chords.
+    let sag = model.apply(mid()).dist((fa + fb) * 0.5) / pixel;
+    let n = ((sag / MAX_SAG_PX).sqrt().ceil() as usize).clamp(1, 32);
+    if n == 1 {
+        return;
+    }
+    let forwards = (a.x, a.y) < (b.x, b.y);
+    let (from, to) = if forwards { (a, b) } else { (b, a) };
+    let inner = geodesic(from, to, n);
+    let inner = inner[1..n].iter().map(|&v| model.apply(v));
+    if forwards { out.extend(inner) } else { out.extend(inner.rev()) }
+}
+
+fn midpoint(a: Vector3D, b: Vector3D) -> Vector3D {
+    // Computed from a canonical end, so both faces sharing an edge agree exactly.
+    let (from, to) = if (a.x, a.y) < (b.x, b.y) { (a, b) } else { (b, a) };
+    towards(from, to, distance(from, to) / 2.0)
 }
 
 /// Enough tiles to fill the disk down to pixel size, wherever the view is centered in the home
@@ -219,10 +340,6 @@ fn geodesic(a: Vector3D, b: Vector3D, n: usize) -> Vec<Vector3D> {
         return vec![a, b];
     }
     (0..=n).map(|k| Vector3D::from_complex(from_origin(ac, w * ((half * k as f64 / n as f64).tanh() / r)))).collect()
-}
-
-fn to_disk_midpoint(a: Vector3D, b: Vector3D) -> Vector3D {
-    towards(a, b, distance(a, b) / 2.0)
 }
 
 pub struct TilingApp {
@@ -375,7 +492,7 @@ mod tests {
                 (0..f.vertices.len()).map(|i| distance(f.vertices[i], f.vertices[(i + 1) % f.vertices.len()]))
             })
             .collect();
-        lengths.extend(t.lines.iter().filter(|(a, b)| near(a) && near(b)).map(|&(a, b)| distance(a, b)));
+        lengths.extend(t.lines.iter().filter(|l| near(&l.a) && near(&l.b)).map(|l| distance(l.a, l.b)));
         lengths
     }
 
@@ -394,6 +511,49 @@ mod tests {
                 assert_eq!(f.vertices.len(), expected as usize);
             }
         }
+    }
+
+    /// Fans of flat triangles are only right if no triangle folds over: all must turn the same
+    /// way. Check every drawn face, across many views and all the models.
+    #[test]
+    fn faces_can_be_drawn_as_fans() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let models = [
+            HyperbolicModel::Poincare,
+            HyperbolicModel::Klein,
+            HyperbolicModel::UpperHalfPlane,
+            HyperbolicModel::Orthographic,
+        ];
+        let pixel = 2.0 * 1.1 / 1600.0;
+        let mut checked = 0;
+        for k in 0..40 {
+            // Views moved a range of distances in a range of directions.
+            let v = Complex::from_polar(0.95 * (k as f64 / 40.0).sqrt(), k as f64 * 2.4);
+            let turn = Complex::from_polar(1.0, k as f64 * 0.7);
+            let view = Isometry::new(Mobius::new(turn, turn * v * -1.0, v.conj() * -1.0, Complex::ONE), None);
+            for m in models {
+                let model = Model::for_puzzle(Geometry::Hyperbolic, m, SphericalModel::Sterographic);
+                let mut scratch = Scratch::default();
+                let screen = Screen { model, pixel, short_edge_px: t.short_edge_px };
+                for face in &t.faces {
+                    let Some(c) = face.ring(&view, &screen, &mut scratch) else {
+                        continue;
+                    };
+                    let areas: Vec<f64> = scratch
+                        .ring
+                        .windows(2)
+                        .map(|w| (w[0].x - c.x) * (w[1].y - c.y) - (w[0].y - c.y) * (w[1].x - c.x))
+                        .collect();
+                    let largest = areas.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+                    let sign = areas.iter().sum::<f64>().signum();
+                    for a in &areas {
+                        assert!(a * sign > -1e-9 * largest, "{m:?}: a fan triangle folds over (view {k})");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 10000);
     }
 
     #[test]

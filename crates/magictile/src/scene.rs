@@ -109,28 +109,21 @@ impl DrawList {
         start..self.solid.len() as u32
     }
 
-    fn push_solid(&mut self, range: Range<u32>, clipped: bool) {
+    pub(crate) fn push_solid(&mut self, range: Range<u32>, clipped: bool) {
         if !range.is_empty() {
             self.cmds.push(Cmd::Solid { range, clipped });
         }
     }
 
     /// A filled fan (convex region) around a center.
-    fn convex_fan(&mut self, center: Vector3D, ring: &[Vector3D], color: Color32) -> Range<u32> {
+    pub(crate) fn convex_fan(&mut self, center: Vector3D, ring: &[Vector3D], color: Color32) -> Range<u32> {
         let tris = ring.windows(2).flat_map(|w| [center, w[0], w[1]]);
         self.solid_triangles(tris, color)
     }
 
     /// Fills a polygon (possibly concave, or containing infinity when `inverted`) with the stencil
     /// technique. `fan_origin` can be any point; `points` are the (transformed) edge points.
-    pub(crate) fn fill(
-        &mut self,
-        fan_origin: Vector3D,
-        points: &[Vector3D],
-        inverted: bool,
-        color: Color32,
-        clipped: bool,
-    ) {
+    fn fill(&mut self, fan_origin: Vector3D, points: &[Vector3D], inverted: bool, color: Color32, clipped: bool) {
         if points.len() < 3 || points.iter().any(|p| p.is_dne()) {
             return;
         }
@@ -174,6 +167,12 @@ impl DrawList {
 
     /// A polyline with a width in pixels.
     pub(crate) fn polyline(&mut self, points: &[Vector3D], width_px: f64, color: Color32, clipped: bool) {
+        let range = self.polyline_triangles(points, width_px, color);
+        self.push_solid(range, clipped);
+    }
+
+    /// A polyline's triangles, without a command to draw them (for batching).
+    pub(crate) fn polyline_triangles(&mut self, points: &[Vector3D], width_px: f64, color: Color32) -> Range<u32> {
         let half = width_px * self.pixel / 2.0;
         let mut tris = Vec::new();
         for w in points.windows(2) {
@@ -191,8 +190,7 @@ impl DrawList {
             let (a, b) = (a - along, b + along);
             tris.extend([a + n, a - n, b + n, b + n, a - n, b - n]);
         }
-        let range = self.solid_triangles(tris, color);
-        self.push_solid(range, clipped);
+        self.solid_triangles(tris, color)
     }
 }
 
