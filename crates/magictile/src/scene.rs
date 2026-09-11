@@ -109,10 +109,20 @@ impl DrawList {
         start..self.solid.len() as u32
     }
 
+    /// Draws solid triangles, merging with the previous command when it draws the triangles just
+    /// before these (so runs of simple polygons and lines become a single draw).
     fn push_solid(&mut self, range: Range<u32>, clipped: bool) {
-        if !range.is_empty() {
-            self.cmds.push(Cmd::Solid { range, clipped });
+        if range.is_empty() {
+            return;
         }
+        if let Some(Cmd::Solid { range: last, clipped: last_clipped }) = self.cmds.last_mut()
+            && *last_clipped == clipped
+            && last.end == range.start
+        {
+            last.end = range.end;
+            return;
+        }
+        self.cmds.push(Cmd::Solid { range, clipped });
     }
 
     /// A filled fan (convex region) around a center.
@@ -121,10 +131,18 @@ impl DrawList {
         self.solid_triangles(tris, color)
     }
 
-    /// Fills a polygon (possibly concave, or containing infinity when `inverted`) with the stencil
-    /// technique. `fan_origin` can be any point; `points` are the (transformed) edge points.
+    /// Fills a polygon (possibly concave, or containing infinity when `inverted`). `fan_origin`
+    /// can be any point; `points` are the (transformed) closed edge points.
+    ///
+    /// Polygons that a fan from `fan_origin` covers exactly (most stickers) are drawn as plain
+    /// triangles, which batch together; the rest use the stencil technique.
     fn fill(&mut self, fan_origin: Vector3D, points: &[Vector3D], inverted: bool, color: Color32, clipped: bool) {
         if points.len() < 3 || points.iter().any(|p| p.is_dne()) {
+            return;
+        }
+        if !inverted && !infinity::is_infinite(fan_origin) && fan_covers(fan_origin, points) {
+            let range = self.convex_fan(fan_origin, points, color);
+            self.push_solid(range, clipped);
             return;
         }
         let cen = if infinity::is_infinite(fan_origin) { infinity::LARGE_FINITE_VECTOR } else { fan_origin };
@@ -187,6 +205,33 @@ impl DrawList {
         let range = self.solid_triangles(tris, color);
         self.push_solid(range, clipped);
     }
+}
+
+/// Whether a fan of triangles from `center` to a closed boundary covers exactly the region the
+/// stencil fill would: every triangle turns the same way, and the boundary goes around once.
+fn fan_covers(center: Vector3D, points: &[Vector3D]) -> bool {
+    let scale = points.iter().map(|p| (*p - center).abs()).fold(0.0, f64::max);
+    let tiny = 1e-12 * scale * scale;
+    let (mut sign, mut turned) = (0.0, 0.0);
+    for w in points.windows(2) {
+        let (a, b) = (w[0] - center, w[1] - center);
+        let cross = a.x * b.y - a.y * b.x;
+        let dot = a.x * b.x + a.y * b.y;
+        if cross.abs() <= tiny {
+            // Repeated points are fine; doubling back through the center isn't.
+            if dot < 0.0 {
+                return false;
+            }
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+        turned += cross.atan2(dot);
+    }
+    (turned.abs() - 2.0 * PI).abs() < 1e-6
 }
 
 fn pt(v: Vector3D) -> [f32; 2] {
@@ -731,4 +776,49 @@ pub fn build_cell_texture(ctx: &SceneContext, master_index: usize) -> DrawList {
         }
     }
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ring(points: &[(f64, f64)]) -> Vec<Vector3D> {
+        let mut r: Vec<Vector3D> = points.iter().map(|&(x, y)| Vector3D::new(x, y)).collect();
+        r.push(r[0]);
+        r
+    }
+
+    #[test]
+    fn fans_cover_star_shaped_polygons_only() {
+        let o = Vector3D::ORIGIN;
+        // Convex, either way round, with a repeated point.
+        assert!(fan_covers(o, &ring(&[(1.0, 0.0), (0.0, 1.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)])));
+        assert!(fan_covers(o, &ring(&[(0.0, -1.0), (-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)])));
+        // An L shape seen from a point in the corner it doesn't contain.
+        let l = ring(&[(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]);
+        assert!(!fan_covers(Vector3D::new(1.8, 1.8), &l));
+        // ...but star-shaped from a point near its elbow.
+        assert!(fan_covers(Vector3D::new(0.5, 0.5), &l));
+        // Going around twice.
+        let twice =
+            ring(&[(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]);
+        assert!(!fan_covers(o, &twice));
+        // The center outside the polygon.
+        assert!(!fan_covers(Vector3D::new(5.0, 0.0), &ring(&[(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)])));
+    }
+
+    #[test]
+    fn consecutive_solid_draws_merge() {
+        let mut list = DrawList::new(Color32::WHITE, Camera::square(1.0), 0.01);
+        let square = ring(&[(1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0)]);
+        list.fill(Vector3D::ORIGIN, &square, false, Color32::RED, false);
+        list.fill(Vector3D::ORIGIN, &square, false, Color32::BLUE, false);
+        assert_eq!(list.cmds.len(), 1);
+        // A clipped draw can't join an unclipped one, and a concave polygon needs the stencil.
+        list.fill(Vector3D::ORIGIN, &square, false, Color32::RED, true);
+        let l = ring(&[(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)]);
+        list.fill(Vector3D::new(1.8, 1.8), &l, false, Color32::RED, false);
+        assert_eq!(list.cmds.len(), 3);
+        assert!(matches!(list.cmds[2], Cmd::Fill { .. }));
+    }
 }
