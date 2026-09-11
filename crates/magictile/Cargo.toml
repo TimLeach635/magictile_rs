@@ -6,4 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "wayland", "x11"] }
+env_logger = "0.11.11"
 magictile-core.workspace = true
+png = "0.18.1"
+pollster = "1.0.1"
+r3.workspace = true
+rand = "0.10.2"
