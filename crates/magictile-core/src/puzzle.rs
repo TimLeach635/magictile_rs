@@ -1314,6 +1314,18 @@ impl Puzzle {
         result
     }
 
+    /// For earthquake twists: the second (chopped off) set of twist data that moves along with a
+    /// twist about `td` in the direction of pants segment `geodesic_seg`, and its slice mask.
+    pub fn earthquake_companion(&self, td: TwistDataId, geodesic_seg: i32) -> Option<(usize, i32)> {
+        let pants = self.twist_data[td].pants.as_ref()?;
+        let lookup = pants.tiny_offset(geodesic_seg);
+        let chopped = Pants::chopped_pants_seg(geodesic_seg);
+        let reflected = pants.hexagon.segments.get(usize::try_from(chopped).ok()?)?.reflect_point(lookup);
+        let other = &self.twist_data[self.closest_twisting_circles(reflected)?];
+        let mask = crate::slice_mask::dir_seg_to_mask(other.pants.as_ref()?.closest_geodesic_seg(reflected));
+        Some((other.identified?, mask))
+    }
+
     /// Marks the stickers moving in a twist (for animation), or clears them.
     pub fn set_twisting(&mut self, twist: &SingleTwist, twisting: bool) {
         let spherical = self.is_spherical();

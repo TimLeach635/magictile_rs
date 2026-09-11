@@ -4,7 +4,6 @@
 
 use crate::cell::CellId;
 use crate::macros::{Macro, SetupMoves};
-use crate::pants::Pants;
 use crate::puzzle::Puzzle;
 use crate::slice_mask;
 use crate::twist::SingleTwist;
@@ -278,21 +277,11 @@ impl TwistController {
 
             // Earthquake scrambling takes some more care.
             if puzzle.config.earthquake()
-                && let Some(pants) = &td.pants
+                && let Some((identified, mask)) =
+                    puzzle.earthquake_companion(td_id, slice_mask::mask_to_dir_seg(twist.slice_mask))
             {
-                let dir_seg = slice_mask::mask_to_dir_seg(twist.slice_mask);
-                let lookup = pants.tiny_offset(dir_seg);
-                let chopped = Pants::chopped_pants_seg(dir_seg);
-                if chopped >= 0 {
-                    let reflected = pants.hexagon.segments[chopped as usize].reflect_point(lookup);
-                    if let Some(td_systolic) = puzzle.closest_twisting_circles(reflected) {
-                        let tds = &puzzle.twist_data[td_systolic];
-                        twist.identified_systolic = tds.identified;
-                        twist.slice_mask_systolic = slice_mask::dir_seg_to_mask(
-                            tds.pants.as_ref().map_or(0, |p| p.closest_geodesic_seg(reflected)),
-                        );
-                    }
-                }
+                twist.identified_systolic = Some(identified);
+                twist.slice_mask_systolic = mask;
             }
 
             self.apply_instantly(puzzle, twist);

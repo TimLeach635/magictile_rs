@@ -94,6 +94,15 @@ impl Library {
         self.by_id.get(id).map(|&i| &self.configs[i])
     }
 
+    /// Finds a puzzle by ID, full display name, or (the first match of) its menu name with or
+    /// without the parenthesised slicing parameters, e.g. "Professor's Cube".
+    pub fn find(&self, name: &str) -> Option<&PuzzleConfig> {
+        let short = |c: &&PuzzleConfig| c.menu_name == name || c.menu_name.split(" (").next() == Some(name);
+        self.config_by_id(name)
+            .or_else(|| self.configs.iter().find(|c| c.display_name == name))
+            .or_else(|| self.configs.iter().find(short))
+    }
+
     fn parse_classes<'a>(&mut self, files: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<PuzzleConfigClass> {
         let mut classes = Vec::new();
         for (name, contents) in files {
@@ -234,6 +243,16 @@ mod tests {
 
         let hyperbolic = lib.config_by_id("Puzzle.{7,3}.Classic").unwrap();
         assert_eq!(hyperbolic.expected_num_colors, 24);
+    }
+
+    #[test]
+    fn finds_puzzles_by_id_or_name() {
+        let lib = Library::load_standard();
+        let id = |name| lib.find(name).map(|c| c.id.as_str());
+        assert_eq!(id("ProfessorsCube"), Some("ProfessorsCube"));
+        assert_eq!(id("Cube Professor's Cube (F0.4:0:1 F0.8:0:1)"), Some("ProfessorsCube"));
+        assert_eq!(id("Professor's Cube"), Some("ProfessorsCube"));
+        assert_eq!(id("No Such Puzzle"), None);
     }
 
     #[test]
