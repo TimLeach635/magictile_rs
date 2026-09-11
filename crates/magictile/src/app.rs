@@ -4,7 +4,7 @@ use crate::render::{FrameJob, PuzzleCallback, Renderer};
 use crate::scene::{self, RenderData, SceneContext};
 use crate::selftest::SelfTest;
 use crate::settings::Settings;
-use crate::view::{DragButton, DragData, Model, View};
+use crate::view::{Model, View};
 use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Rect, Sense};
 use eframe::egui_wgpu;
 use magictile_core::controller::rotation_step;
@@ -62,8 +62,6 @@ impl BuildProgress for ThreadProgress {
 /// Mouse state for distinguishing clicks from drags (as the original's `MouseHandler`).
 #[derive(Default)]
 struct Mouse {
-    /// When the last drag movement happened (a release soon after is a flick).
-    last_drag: Option<Instant>,
     /// Pressing while gliding stops it, and shouldn't also count as a click.
     skip_click: bool,
     hover: Option<Pos2>,
@@ -238,7 +236,7 @@ impl MagicTileApp {
         };
         let previous = (self.closest_twist, self.closest_geodesic_seg);
         let puzzle = &loaded.puzzle;
-        match self.view.space_coords_no_view(puzzle, model, pos.x, pos.y) {
+        match self.view.space_coords_no_view(model, pos.x, pos.y) {
             Some(p) => {
                 self.closest_twist = puzzle.closest_twisting_circles(p);
                 if puzzle.config.systolic()
@@ -265,7 +263,7 @@ impl MagicTileApp {
 
         // Macros.
         if modifiers.alt {
-            let Some(space) = self.view.space_coords_no_view(puzzle, model, pos.x, pos.y) else {
+            let Some(space) = self.view.space_coords_no_view(model, pos.x, pos.y) else {
                 return;
             };
             let Some(cell) = puzzle.closest_cell(space) else {
@@ -287,7 +285,7 @@ impl MagicTileApp {
 
         // Lights on.
         if puzzle.config.is_toggling() {
-            if let Some(space) = self.view.space_coords_no_view(puzzle, model, pos.x, pos.y)
+            if let Some(space) = self.view.space_coords_no_view(model, pos.x, pos.y)
                 && let Some(cell) = puzzle.closest_cell(space)
             {
                 if self.controller.toggle(puzzle, cell).solved {
@@ -353,65 +351,13 @@ impl MagicTileApp {
             self.closest_twist = None;
         }
 
-        if response.is_pointer_button_down_on() && ctx.input(|i| i.pointer.any_pressed()) {
+        let nav = self.view.navigate(ctx, response, rect, model, self.settings.gliding);
+        if let Some(was_gliding) = nav.pressed {
             // Pressing while gliding stops it, and doesn't count as a click.
-            self.mouse.skip_click = self.view.spinning();
-            self.view.stop_spinning();
+            self.mouse.skip_click = was_gliding;
         }
-
-        // Drags.
-        for (egui_button, button) in [
-            (PointerButton::Primary, DragButton::Primary),
-            (PointerButton::Middle, DragButton::Middle),
-            (PointerButton::Secondary, DragButton::Secondary),
-        ] {
-            if !response.dragged_by(egui_button) {
-                continue;
-            }
-            let delta = response.drag_delta();
-            if delta == egui::Vec2::ZERO {
-                continue;
-            }
-            let Some(pos) = response.interact_pointer_pos().map(to_view) else {
-                continue;
-            };
-            let (w, h) = (rect.width(), rect.height());
-            let (x1, y1) = (pos.x - delta.x - w / 2.0, h / 2.0 - (pos.y - delta.y));
-            let (x2, y2) = (pos.x - w / 2.0, h / 2.0 - pos.y);
-            let drag = DragData {
-                x: pos.x,
-                y: pos.y,
-                x_diff: delta.x,
-                y_diff: delta.y,
-                y_percent: delta.y / h,
-                rotation: y2.atan2(x2) - y1.atan2(x1),
-                button,
-            };
-            self.view.drag(self.loaded.as_ref().map(|l| &l.puzzle), model, drag);
-            self.mouse.last_drag = Some(Instant::now());
-        }
-        if response.drag_stopped() {
-            // Using elapsed time works much better than how far we moved.
-            let flick = self.mouse.last_drag.is_some_and(|t| t.elapsed() < Duration::from_millis(50));
-            self.view.release(flick, self.settings.gliding);
+        if nav.drag_stopped {
             self.mouse.skip_click = false;
-        }
-
-        // Zooming with the scroll wheel.
-        if response.hovered() {
-            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                let drag = DragData {
-                    x: 0.0,
-                    y: 0.0,
-                    x_diff: 0.0,
-                    y_diff: 0.0,
-                    y_percent: -scroll / rect.height(),
-                    rotation: 0.0,
-                    button: DragButton::Secondary,
-                };
-                self.view.drag(None, model, drag);
-            }
         }
 
         // Clicks.
@@ -571,7 +517,7 @@ impl MagicTileApp {
 
         if self.view.spinning() {
             active = true;
-            self.view.step_spin(self.loaded.as_ref().map(|l| &l.puzzle), model, dt, self.settings.gliding);
+            self.view.step_spin(model, dt, self.settings.gliding);
         }
         active
     }
@@ -760,7 +706,9 @@ impl MagicTileApp {
         };
         let ppp = ctx.pixels_per_point();
         let (view_list, closest) = scene::build_view(&ctx_scene, &self.view, ppp);
-        self.view.closest = closest;
+        // Moving back to the home copy of the first master is a symmetry of the puzzle.
+        self.view.recenter =
+            closest.filter(|&c| !loaded.puzzle.cells[c].is_master()).map(|c| loaded.puzzle.cells[c].isometry.inverse());
         self.textures_valid.iter_mut().for_each(|v| *v = true);
 
         let size_px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];

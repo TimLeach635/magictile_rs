@@ -112,7 +112,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             rotation: 0.0,
             button: DragButton::Primary,
         };
-        view.drag(Some(&puzzle), model, drag);
+        view.drag(model, drag);
     }
 
     // Part way through a twist of the first logical twist.

@@ -123,7 +123,14 @@ impl DrawList {
 
     /// Fills a polygon (possibly concave, or containing infinity when `inverted`) with the stencil
     /// technique. `fan_origin` can be any point; `points` are the (transformed) edge points.
-    fn fill(&mut self, fan_origin: Vector3D, points: &[Vector3D], inverted: bool, color: Color32, clipped: bool) {
+    pub(crate) fn fill(
+        &mut self,
+        fan_origin: Vector3D,
+        points: &[Vector3D],
+        inverted: bool,
+        color: Color32,
+        clipped: bool,
+    ) {
         if points.len() < 3 || points.iter().any(|p| p.is_dne()) {
             return;
         }
@@ -166,7 +173,7 @@ impl DrawList {
     }
 
     /// A polyline with a width in pixels.
-    fn polyline(&mut self, points: &[Vector3D], width_px: f64, color: Color32, clipped: bool) {
+    pub(crate) fn polyline(&mut self, points: &[Vector3D], width_px: f64, color: Color32, clipped: bool) {
         let half = width_px * self.pixel / 2.0;
         let mut tris = Vec::new();
         for w in points.windows(2) {
@@ -456,6 +463,32 @@ fn build_hemisphere_disks(ctx: &SceneContext, view: &View, list: &mut DrawList) 
 }
 
 /// Draws Euclidean and hyperbolic puzzles with cell textures.
+/// Fills the whole hyperbolic plane as it appears in a model.
+pub(crate) fn fill_hyperbolic_plane(list: &mut DrawList, model: Model, color: Color32) {
+    match model {
+        Model::Hyperbolic(HyperbolicModel::UpperHalfPlane) | Model::Hyperbolic(HyperbolicModel::Orthographic) => {
+            let big = 10000.0;
+            let bottom = if model == Model::Hyperbolic(HyperbolicModel::UpperHalfPlane) { -1.0 } else { -big };
+            let quad = [
+                Vector3D::new(big, bottom),
+                Vector3D::new(big, big),
+                Vector3D::new(-big, big),
+                Vector3D::new(big, bottom),
+                Vector3D::new(-big, big),
+                Vector3D::new(-big, bottom),
+            ];
+            let r = list.solid_triangles(quad, color);
+            list.push_solid(r, false);
+        }
+        _ => {
+            let ring: Vec<Vector3D> =
+                (0..=250).map(|i| 2.0 * PI * i as f64 / 250.0).map(|a| Vector3D::new(a.cos(), a.sin())).collect();
+            let r = list.convex_fan(Vector3D::ORIGIN, &ring, color);
+            list.push_solid(r, false);
+        }
+    }
+}
+
 fn build_textured(ctx: &SceneContext, view: &View, list: &mut DrawList) -> Option<CellId> {
     let p = ctx.puzzle;
     let s = ctx.settings;
@@ -463,28 +496,7 @@ fn build_textured(ctx: &SceneContext, view: &View, list: &mut DrawList) -> Optio
 
     // The disk, where the background and edge colors differ.
     if p.config.geometry() == Geometry::Hyperbolic && s.color_bg != s.color_tile_edges {
-        match ctx.model {
-            Model::Hyperbolic(HyperbolicModel::UpperHalfPlane) | Model::Hyperbolic(HyperbolicModel::Orthographic) => {
-                let big = 10000.0;
-                let bottom = if ctx.model == Model::Hyperbolic(HyperbolicModel::UpperHalfPlane) { -1.0 } else { -big };
-                let quad = [
-                    Vector3D::new(big, bottom),
-                    Vector3D::new(big, big),
-                    Vector3D::new(-big, big),
-                    Vector3D::new(big, bottom),
-                    Vector3D::new(-big, big),
-                    Vector3D::new(-big, bottom),
-                ];
-                let r = list.solid_triangles(quad, s.color_tile_edges);
-                list.push_solid(r, false);
-            }
-            _ => {
-                let ring: Vec<Vector3D> =
-                    (0..=250).map(|i| 2.0 * PI * i as f64 / 250.0).map(|a| Vector3D::new(a.cos(), a.sin())).collect();
-                let r = list.convex_fan(Vector3D::ORIGIN, &ring, s.color_tile_edges);
-                list.push_solid(r, false);
-            }
-        }
+        fill_hyperbolic_plane(list, ctx.model, s.color_tile_edges);
     }
 
     let start = list.cell_indices.len() as u32;

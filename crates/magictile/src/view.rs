@@ -1,10 +1,10 @@
 //! The 2D view: panning, rotating and zooming (the original's `MouseMotion`, 2D parts).
 
-use magictile_core::Puzzle;
-use magictile_core::cell::CellId;
+use eframe::egui::{self, PointerButton, Pos2, Rect};
 use r3::models::{self, HyperbolicModel, SphericalModel};
 use r3::{Geometry, Isometry, Mobius, Transform, Vector3D};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// Which kind of drag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +92,12 @@ pub struct View {
     /// View size in points.
     pub width: f32,
     pub height: f32,
-    /// The cell (a copy of the first master) drawn closest to the center, found while
-    /// rendering. Used to recenter infinite tilings.
-    pub closest: Option<CellId>,
+    /// A symmetry of the tiling that moves the home tile back near the center, found while
+    /// rendering (from the copy of the home tile drawn closest to the center). Applied before
+    /// the next pan, keeping numbers well behaved on infinite tilings.
+    pub recenter: Option<Isometry>,
+    /// When the last drag movement happened (a release soon after is a flick).
+    last_drag: Option<Instant>,
     // Gliding after a flick.
     recent_drags: VecDeque<DragData>,
     spin: Option<DragData>,
@@ -110,7 +113,8 @@ impl Default for View {
             geometry: Geometry::Hyperbolic,
             width: 1.0,
             height: 1.0,
-            closest: None,
+            recenter: None,
+            last_drag: None,
             recent_drags: VecDeque::new(),
             spin: None,
             spin_accumulator: 0.0,
@@ -152,45 +156,38 @@ impl View {
         model.to_standard(self.screen_to_model(x, y))
     }
 
-    /// Screen point to puzzle coordinates (undoing the view isometry). `None` outside the
+    /// Screen point to tiling coordinates (undoing the view isometry). `None` outside the
     /// Poincaré disk.
-    pub fn space_coords_no_view(&mut self, puzzle: &Puzzle, model: Model, x: f32, y: f32) -> Option<Vector3D> {
-        self.recenter(puzzle);
+    pub fn space_coords_no_view(&mut self, model: Model, x: f32, y: f32) -> Option<Vector3D> {
+        self.apply_recenter();
         let space = self.screen_to_gl(model, x, y);
 
         // Same clamp as for panning.
-        if puzzle.config.geometry() == Geometry::Hyperbolic && space.abs() > 0.98 {
+        if self.geometry == Geometry::Hyperbolic && space.abs() > 0.98 {
             return None;
         }
         Some(self.isometry.inverse().apply(space))
     }
 
-    /// Moves the view to the copy of the home cell nearest the center, keeping numbers well
-    /// behaved on infinite tilings.
-    pub fn recenter(&mut self, puzzle: &Puzzle) {
-        let Some(closest) = self.closest.take() else {
-            return;
-        };
-        if puzzle.cells.get(closest).is_some_and(|c| !c.is_master()) {
-            let recenter = puzzle.cells[closest].isometry.inverse();
+    /// Applies a pending recentering (see [`View::recenter`]). The picture doesn't change.
+    pub fn apply_recenter(&mut self) {
+        if let Some(recenter) = self.recenter.take() {
             self.isometry = &self.isometry * &recenter;
         }
     }
 
-    pub fn drag(&mut self, puzzle: Option<&Puzzle>, model: Model, drag: DragData) {
-        self.perform_drag(puzzle, model, drag);
+    pub fn drag(&mut self, model: Model, drag: DragData) {
+        self.perform_drag(model, drag);
         self.recent_drags.push_back(drag);
         if self.recent_drags.len() > 2 {
             self.recent_drags.pop_front();
         }
     }
 
-    fn perform_drag(&mut self, puzzle: Option<&Puzzle>, model: Model, drag: DragData) {
+    fn perform_drag(&mut self, model: Model, drag: DragData) {
         match drag.button {
             DragButton::Primary => {
-                if let Some(p) = puzzle {
-                    self.recenter(p);
-                }
+                self.apply_recenter();
                 let p1 = self.screen_to_gl(model, drag.x - drag.x_diff, drag.y - drag.y_diff);
                 let p2 = self.screen_to_gl(model, drag.x, drag.y);
                 match self.geometry {
@@ -259,7 +256,7 @@ impl View {
     }
 
     /// Advances gliding by some seconds. Returns true if the view moved.
-    pub fn step_spin(&mut self, puzzle: Option<&Puzzle>, model: Model, dt: f64, gliding: f64) -> bool {
+    pub fn step_spin(&mut self, model: Model, dt: f64, gliding: f64) -> bool {
         let mut moved = false;
         self.spin_accumulator += dt;
         while self.spin_accumulator >= SPIN_INTERVAL {
@@ -280,10 +277,96 @@ impl View {
                 return moved;
             }
             self.spin = Some(spin);
-            self.perform_drag(puzzle, model, spin);
+            self.perform_drag(model, spin);
             moved = true;
         }
         moved
+    }
+}
+
+/// What [`View::navigate`] saw happen this frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Navigation {
+    /// A button was pressed on the view; the flag says whether it stopped gliding.
+    pub pressed: Option<bool>,
+    /// A drag just ended.
+    pub drag_stopped: bool,
+}
+
+impl View {
+    /// Mouse navigation for a view occupying `rect`: left drag pans, middle drag rotates, right
+    /// drag and the scroll wheel zoom, and flicks glide.
+    pub fn navigate(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        rect: Rect,
+        model: Model,
+        gliding: f64,
+    ) -> Navigation {
+        let mut nav = Navigation::default();
+        let to_view = |p: Pos2| p - rect.min.to_vec2();
+
+        if response.is_pointer_button_down_on() && ctx.input(|i| i.pointer.any_pressed()) {
+            // Pressing while gliding stops it.
+            nav.pressed = Some(self.spinning());
+            self.stop_spinning();
+        }
+
+        for (egui_button, button) in [
+            (PointerButton::Primary, DragButton::Primary),
+            (PointerButton::Middle, DragButton::Middle),
+            (PointerButton::Secondary, DragButton::Secondary),
+        ] {
+            if !response.dragged_by(egui_button) {
+                continue;
+            }
+            let delta = response.drag_delta();
+            if delta == egui::Vec2::ZERO {
+                continue;
+            }
+            let Some(pos) = response.interact_pointer_pos().map(to_view) else {
+                continue;
+            };
+            let (w, h) = (rect.width(), rect.height());
+            let (x1, y1) = (pos.x - delta.x - w / 2.0, h / 2.0 - (pos.y - delta.y));
+            let (x2, y2) = (pos.x - w / 2.0, h / 2.0 - pos.y);
+            let drag = DragData {
+                x: pos.x,
+                y: pos.y,
+                x_diff: delta.x,
+                y_diff: delta.y,
+                y_percent: delta.y / h,
+                rotation: y2.atan2(x2) - y1.atan2(x1),
+                button,
+            };
+            self.drag(model, drag);
+            self.last_drag = Some(Instant::now());
+        }
+        if response.drag_stopped() {
+            // Using elapsed time works much better than how far we moved.
+            let flick = self.last_drag.is_some_and(|t| t.elapsed() < Duration::from_millis(50));
+            self.release(flick, gliding);
+            nav.drag_stopped = true;
+        }
+
+        // Zooming with the scroll wheel.
+        if response.hovered() {
+            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let drag = DragData {
+                    x: 0.0,
+                    y: 0.0,
+                    x_diff: 0.0,
+                    y_diff: 0.0,
+                    y_percent: -scroll / rect.height(),
+                    rotation: 0.0,
+                    button: DragButton::Secondary,
+                };
+                self.drag(model, drag);
+            }
+        }
+        nav
     }
 }
 
