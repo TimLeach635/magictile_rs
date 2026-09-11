@@ -65,7 +65,16 @@ MagicTile/          original C# source (reference only)
   they round-trip through save files.
 - The four view-only IRP configs (no identifications) are hidden from the menu.
 - Known C# bugs to fix rather than port: data race on `List.Add` inside `Parallel.For` in
-  `MarkCellsForStateCalcs`; null deref in `Loader.SetVersionOnConfig` when `Version` is missing.
+  `MarkCellsForStateCalcs`; null deref in `Loader.SetVersionOnConfig` when `Version` is missing;
+  the off colour (-1) of lights-on puzzles saved as `0ffffffff`, which couldn't be loaded (we write
+  `ff` and read both); infinite loop when group relations can't generate enough identifications;
+  loading macros from a saved log (the original crashed).
+- **DataContract reading semantics are reproduced** (`magictile_core::xml::data_contract_members`):
+  elements are matched in alphabetical member order and out-of-order ones are ignored, and missing
+  values are zero/empty (the deserializer skips constructors, e.g. `UseMirroredEdgeSet` defaults to
+  false in files but true in code). Two shipped files depend on this.
+- **C# object aliasing is reproduced** where it changes results: a polygon reflected in one of its own
+  segments (`Polygon::reflect_in_own_segment`), and `Pants.Clone` not copying its isometry.
 - Unused R3 code is not ported: Honeycombs, Shapeways, PovRay, STL, GraphRelaxation, Golden, VRML,
   Polytope, Surface/Torus/KleinBottle, RotationHandler4D, Matrix4D, Lighting, VBO.
 
@@ -77,9 +86,17 @@ MagicTile/          original C# source (reference only)
    maps, texture-coordinate helpers, .NET-compatible hashing. 50 unit tests.
    Known original behaviour kept: spherical tilings rely on an exact `NumTiles` (the face at infinity
    can't be deduplicated), and the slicer can't cut a circle lying entirely inside a polygon.
-2. **`magictile-core`** — config + menu loading, puzzle building, topology analysis, state, twisting,
-   history, macros, setup moves / commutators, lights-on toggling, save/load. Headless test that builds
-   every shipped puzzle config and checks colour counts against `ExpectedNumColors`.
+2. ✅ **`magictile-core`** — config + menu loading (configs embedded), puzzle building, topology
+   analysis, state, twisting (`TwistController`, driven per frame), history, macros, setup moves /
+   commutators, lights-on toggling, save/load of logs and macro files.
+   All 2287 library entries build (`cargo run --release -p magictile-core --example build_stats`;
+   also `cargo test --release -- --ignored`). Colour counts match `ExpectedNumColors` except two
+   classes whose files disagree with themselves in the original too ({4,4} 9C (shift), {6,3} 9C (3x3));
+   the latter's author comment ("setting 9 only loads 7 colours") is reproduced exactly.
+   Not yet ported (renderer needs): per-cell texture vertices (compute on demand from
+   `template_texture_coords`), and `PrepareSurfaceData` (needed for the hemisphere-disks model).
+   Slowest builds (~5 s, e.g. {8,4} 5C F0:0.85:0 E0.5:0:0) spend their time marking affected stickers;
+   a spatial prefilter could speed this up without changing results.
 3. **Rendering** — direct spherical rendering (stencil fill for concave / inverted polygons),
    render-to-texture for Euclidean / hyperbolic cells, model options, pan / rotate / zoom with gliding,
    twisting-circle highlighting, twist animation.
