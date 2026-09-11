@@ -204,7 +204,30 @@ impl Segment {
         self.p1 = f(self.p1);
         self.p2 = f(self.p2);
         let mid = f(mid);
+        self.finish_mapping(mid);
+    }
 
+    /// Reflects us in ourselves, reproducing the original's aliasing when a polygon is reflected
+    /// in one of its own segments (the same object): the reflecting segment changes as its
+    /// endpoints are updated, so this isn't quite the identity.
+    pub fn reflect_in_self(&mut self) {
+        let mut mid = self.midpoint();
+        if infinity::is_infinite(mid) {
+            mid = if infinity::is_infinite(self.p1) {
+                self.p2 * infinity::FINITE_SCALE
+            } else {
+                self.p1 * infinity::FINITE_SCALE
+            };
+        }
+
+        self.p1 = self.reflect_point(self.p1);
+        self.p2 = self.reflect_point(self.p2);
+        let mid = self.reflect_point(mid);
+        self.finish_mapping(mid);
+    }
+
+    /// Recomputes our type and arc parameters from mapped endpoints and midpoint.
+    fn finish_mapping(&mut self, mid: Vector3D) {
         let mut temp = Circle::default();
         if !infinity::is_infinite(self.p1)
             && !infinity::is_infinite(self.p2)
@@ -524,6 +547,21 @@ impl Polygon {
         self.center = s.reflect_point(self.center);
     }
 
+    /// Reflects us in our own segment `k`, as the original does when passed one of its own
+    /// segments: segment `k` changes as it is reflected in itself, and later segments (and the
+    /// center) use the changed version.
+    pub fn reflect_in_own_segment(&mut self, k: usize) {
+        for i in 0..self.segments.len() {
+            if i == k {
+                self.segments[k].reflect_in_self();
+            } else {
+                let s = self.segments[k];
+                self.segments[i].reflect(&s);
+            }
+        }
+        self.center = self.segments[k].reflect_point(self.center);
+    }
+
     pub fn transform(&mut self, t: &impl Transform) {
         for s in &mut self.segments {
             s.transform(t);
@@ -748,6 +786,20 @@ mod tests {
         reflected.reflect(&poly.segments[0]);
         assert!(!reflected.orientation());
         assert_eq!(reflected.segments[0].p1, poly.segments[0].p1);
+    }
+
+    #[test]
+    fn reflecting_in_own_segment_is_nearly_a_plain_reflection() {
+        let mut poly = Polygon::default();
+        poly.create_regular(7, 3);
+        let mut aliased = poly.clone();
+        aliased.reflect_in_own_segment(2);
+        let mut plain = poly.clone();
+        plain.reflect(&poly.segments[2]);
+        for (a, b) in aliased.vertices().iter().zip(plain.vertices()) {
+            assert_eq!(*a, b);
+        }
+        assert_eq!(aliased.center, plain.center);
     }
 
     #[test]

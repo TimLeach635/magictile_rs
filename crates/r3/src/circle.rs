@@ -7,7 +7,6 @@ use crate::nethash::{self, NetKey};
 use crate::polygon::{Polygon, Segment, SegmentType};
 use crate::tolerance::{self, THRESHOLD};
 use crate::vector3d::Vector3D;
-use std::cell::Cell;
 use std::f64::consts::PI;
 use std::ops::{Deref, DerefMut};
 
@@ -234,8 +233,6 @@ impl Circle {
 pub struct CircleNE {
     pub circle: Circle,
     pub center_ne: Vector3D,
-    /// A cache clients may use for [`CircleNE::inverted`]. We do nothing with it ourselves.
-    pub inverted_cached: Cell<Option<bool>>,
 }
 
 impl Deref for CircleNE {
@@ -253,7 +250,7 @@ impl DerefMut for CircleNE {
 
 impl CircleNE {
     pub fn new(circle: Circle, center_ne: Vector3D) -> Self {
-        CircleNE { circle, center_ne, inverted_cached: Cell::new(None) }
+        CircleNE { circle, center_ne }
     }
 
     pub fn reflect(&mut self, c: &Circle) {
@@ -313,19 +310,11 @@ impl CircleNE {
         self.is_point_inside_ne(test_point)
     }
 
-    /// Whether a point is outside c1 and inside c2 (in the non-Euclidean sense), caching inversion.
+    /// Whether a point is outside c1 and inside c2 (in the non-Euclidean sense). (The original
+    /// cached `inverted` on the circles here; it's a pure function of the circle, so we don't.)
     pub fn is_between_hypercycles_fast(c1: &CircleNE, c2: &CircleNE, test_point: Vector3D) -> bool {
-        let inverted = |c: &CircleNE| match c.inverted_cached.get() {
-            Some(v) => v,
-            None => {
-                let v = c.inverted();
-                c.inverted_cached.set(Some(v));
-                v
-            }
-        };
-
         let mut inside_c1 = c1.is_point_inside_fast(test_point);
-        if inverted(c1) {
+        if c1.inverted() {
             inside_c1 = !inside_c1;
         }
         if inside_c1 {
@@ -333,7 +322,7 @@ impl CircleNE {
         }
 
         let mut inside_c2 = c2.is_point_inside_fast(test_point);
-        if inverted(c2) {
+        if c2.inverted() {
             inside_c2 = !inside_c2;
         }
         inside_c2

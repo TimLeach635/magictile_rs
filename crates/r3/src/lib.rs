@@ -10,6 +10,7 @@ pub mod complex;
 pub mod donhatch;
 pub mod euclidean2d;
 pub mod geometry2d;
+pub mod h3;
 pub mod infinity;
 pub mod isometry;
 pub mod mobius;
