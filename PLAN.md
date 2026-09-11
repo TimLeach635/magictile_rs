@@ -28,18 +28,19 @@ MagicTile/          original C# source (reference only)
 
 | Need | Crate |
 |---|---|
-| Complex numbers (Möbius maps) | `num-complex` |
-| Camera / projection matrices | `glam` |
-| GPU rendering | `wgpu` (via `egui-wgpu` callback) |
-| UI / windowing | `eframe`, `egui`, `egui_extras` |
-| Thick lines (twist circles) | `lyon` (stroke tessellation) |
-| XML | `quick-xml` (+ `serde`) |
+| UI / windowing | `eframe` 0.34 (wgpu backend; 0.35 can't resolve `egui_glow`) |
+| GPU rendering | `wgpu` (re-exported by eframe, via an `egui-wgpu` paint callback) |
+| Vertex data | `bytemuck` |
+| XML reading | `roxmltree` (writing is hand-rolled to match DataContract output) |
 | Embedded config dir | `include_dir` |
-| File dialogs | `rfd` (async API, works on wasm) |
-| Parallelism | `rayon` (must stay deterministic) |
+| Parallel puzzle building | `rayon` (optional feature; results are order-independent) |
 | Randomness | `rand` |
-| Platform dirs | `directories` |
-| Screenshots | `image` |
+| Headless screenshots | `pollster`, `png` |
+| Logging (`RUST_LOG=wgpu=warn`, …) | `env_logger` |
+
+Complex numbers, matrices and thick lines are small enough to live in `r3` / the renderer, which keeps
+.NET numeric behaviour under our control. Still to add in phase 4: `rfd` (file dialogs), `directories`
+(settings location).
 
 ## Porting notes / invariants
 
@@ -93,13 +94,31 @@ MagicTile/          original C# source (reference only)
    also `cargo test --release -- --ignored`). Colour counts match `ExpectedNumColors` except two
    classes whose files disagree with themselves in the original too ({4,4} 9C (shift), {6,3} 9C (3x3));
    the latter's author comment ("setting 9 only loads 7 colours") is reproduced exactly.
-   Not yet ported (renderer needs): per-cell texture vertices (compute on demand from
-   `template_texture_coords`), and `PrepareSurfaceData` (needed for the hemisphere-disks model).
+   Per-cell texture vertices are computed by the renderer (`scene::RenderData`); the hemisphere-disks
+   model is drawn directly, so `PrepareSurfaceData` isn't needed.
    Slowest builds (~5 s, e.g. {8,4} 5C F0:0.85:0 E0.5:0:0) spend their time marking affected stickers;
    a spatial prefilter could speed this up without changing results.
-3. **Rendering** — direct spherical rendering (stencil fill for concave / inverted polygons),
-   render-to-texture for Euclidean / hyperbolic cells, model options, pan / rotate / zoom with gliding,
-   twisting-circle highlighting, twist animation.
+3. ✅ **Rendering and interaction** (`crates/magictile`) — CPU geometry each frame into draw lists,
+   drawn by wgpu into an offscreen 4x MSAA target and blitted into egui.
+   - Spherical puzzles are drawn sticker by sticker with a two-pass stencil fill (concave and
+     "inverted" polygons containing infinity); the hemisphere-disks model uses a stencil clip bit.
+   - Euclidean / hyperbolic puzzles render each master cell into a layer of a 512² texture array
+     (with mipmaps) and map it onto every visible copy, with the original's level-of-detail rules.
+   - All display models: Poincaré, Klein, upper half-plane, orthographic; stereographic, gnomonic,
+     fisheye, hemisphere disks (F7 cycles).
+   - The original's `MouseMotion`: pan (Don Hatch's pure hyperbolic translation), rotate (right
+     drag), zoom (middle drag / scroll), gliding after a flick, recentering onto the nearest copy.
+   - Twisting-circle highlighting (incl. systolic hypercycles / pants and earthquake segments),
+     left / right click twists with eased animation, held number keys for slice masks, Alt-click
+     macros (Ctrl+Alt+click records), lights-on toggling, undo / redo, scrambles.
+   - A minimal menu bar and puzzle tree (phase 4 fleshes these out).
+   - Testing without a person: `magictile --screenshot out.png [options] [puzzle]` renders headless;
+     `MAGICTILE_SELFTEST` / `MAGICTILE_SCRIPT` drive the real app with scripted input and capture
+     frames (see `selftest.rs`; it submits its own GPU work so it works even when the window is
+     occluded and egui skips presenting).
+   Deliberate differences: scroll-wheel zoom follows the platform convention; gliding stops when the
+   speed (not either component) is small. Kept original behaviour: earthquake twists show small gaps
+   mid-animation (the original draws them the same way).
 4. **App shell** — menus, puzzle tree, settings panel, macro list, status bar, dialogs, keyboard
    shortcuts, solved notification.
 5. **Extras (optional)** — GAP export, SVG export, screenshots.
