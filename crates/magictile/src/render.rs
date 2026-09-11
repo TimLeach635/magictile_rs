@@ -119,11 +119,16 @@ pub struct Renderer {
 
 struct CellTextures {
     generation: u64,
-    texture: wgpu::Texture,
+    /// Owns the texture the views below look into.
+    _texture: wgpu::Texture,
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     bind_group_no_mips: wgpu::BindGroup,
+    /// Per layer: a view of each mip level, and bind groups for sampling each level (to
+    /// generate the next).
+    levels: Vec<Vec<wgpu::TextureView>>,
+    level_bind_groups: Vec<Vec<wgpu::BindGroup>>,
 }
 
 struct ViewTarget {
@@ -389,17 +394,10 @@ impl Renderer {
 
         let cells = self.cells.as_ref().unwrap();
         for (layer, list) in &job.cell_jobs {
-            let resolve = cells.texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_mip_level: 0,
-                mip_level_count: Some(1),
-                base_array_layer: *layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            });
-            self.draw(device, encoder, list, &cells.msaa, &resolve, &cells.depth, None);
+            let layer = *layer as usize;
+            self.draw(device, encoder, list, &cells.msaa, &cells.levels[layer][0], &cells.depth, None);
             if job.mipmaps {
-                self.generate_mipmaps(device, encoder, &cells.texture, *layer);
+                self.generate_mipmaps(encoder, cells, layer);
             }
         }
 
@@ -495,7 +493,36 @@ impl Renderer {
         };
         let bind_group = bind(&self.sampler);
         let bind_group_no_mips = bind(&self.sampler_no_mips);
-        self.cells = Some(CellTextures { generation, texture, msaa, depth, bind_group, bind_group_no_mips });
+        let levels: Vec<Vec<wgpu::TextureView>> = (0..layers)
+            .map(|layer| {
+                (0..CELL_MIP_LEVELS)
+                    .map(|level| {
+                        texture.create_view(&wgpu::TextureViewDescriptor {
+                            dimension: Some(wgpu::TextureViewDimension::D2),
+                            base_mip_level: level,
+                            mip_level_count: Some(1),
+                            base_array_layer: layer,
+                            array_layer_count: Some(1),
+                            ..Default::default()
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        let level_bind_groups = levels
+            .iter()
+            .map(|views| views.iter().map(|v| self.blit_bind_group(device, v, &self.sampler_no_mips)).collect())
+            .collect();
+        self.cells = Some(CellTextures {
+            generation,
+            _texture: texture,
+            msaa,
+            depth,
+            bind_group,
+            bind_group_no_mips,
+            levels,
+            level_bind_groups,
+        });
     }
 
     fn ensure_view(&mut self, device: &wgpu::Device, size: [u32; 2]) {
@@ -633,31 +660,12 @@ impl Renderer {
         }
     }
 
-    fn generate_mipmaps(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        texture: &wgpu::Texture,
-        layer: u32,
-    ) {
-        let level_view = |level| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_mip_level: level,
-                mip_level_count: Some(1),
-                base_array_layer: layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
-        };
-        for level in 1..CELL_MIP_LEVELS {
-            let source = level_view(level - 1);
-            let target = level_view(level);
-            let bind_group = self.blit_bind_group(device, &source, &self.sampler_no_mips);
+    fn generate_mipmaps(&self, encoder: &mut wgpu::CommandEncoder, cells: &CellTextures, layer: usize) {
+        for level in 1..CELL_MIP_LEVELS as usize {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mipmap"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
+                    view: &cells.levels[layer][level],
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -671,7 +679,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.mip);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &cells.level_bind_groups[layer][level - 1], &[]);
             pass.draw(0..3, 0..1);
         }
     }
