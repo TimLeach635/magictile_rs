@@ -1,0 +1,9 @@
+[package]
+name = "magictile-core"
+description = "MagicTile puzzle model: configuration, building, state and twisting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+r3.workspace = true

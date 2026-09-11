@@ -1,0 +1,9 @@
+[package]
+name = "magictile"
+description = "MagicTile: Rubik's Cube-like puzzles on colored regular tilings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magictile-core.workspace = true
