@@ -156,7 +156,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "Scene: cell textures {:.1} ms, view {:.1} ms ({} fills, {} cell triangles)",
         textures.as_secs_f64() * 1000.0,
         (start.elapsed() - textures).as_secs_f64() * 1000.0,
-        view_list.cmds.iter().filter(|c| matches!(c, scene::Cmd::Fill { .. })).count(),
+        view_list.cmds.iter().filter(|c| matches!(c, crate::draw::Cmd::Fill { .. })).count(),
         view_list.cell_indices.len() / 3
     );
     let job = FrameJob {
@@ -169,7 +169,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     };
 
     let pixels = pollster::block_on(render(&job))?;
-    write_png(&o.output.to_string_lossy(), o.size, &pixels)?;
+    crate::render::write_png(&o.output.to_string_lossy(), o.size, &pixels)?;
     eprintln!("Wrote {}", o.output.display());
     Ok(())
 }
@@ -188,13 +188,4 @@ async fn render(job: &FrameJob) -> Result<Vec<u8>, String> {
     renderer.render_job(&device, &mut encoder, job);
     queue.submit([encoder.finish()]);
     renderer.read_view(&device, &queue)
-}
-
-pub fn write_png(path: &str, size: [u32; 2], rgba: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), size[0], size[1]);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(rgba).map_err(|e| e.to_string())
 }

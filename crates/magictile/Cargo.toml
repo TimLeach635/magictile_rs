@@ -5,12 +5,46 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+# cdylib for the browser build, rlib for the binaries.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["puzzle"]
+# The MagicTile puzzle app. Without it only the tiling viewer is built, which is what the browser
+# build uses: no puzzle configs to embed, no threads, and no randomness.
+puzzle = ["dep:magictile-core", "dep:pollster", "dep:rand"]
+
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+r3.workspace = true
+# std::time::Instant panics in browsers; this is std elsewhere.
+web-time = "1.1.0"
+
+magictile-core = { workspace = true, optional = true }
+pollster = { version = "1.0.1", optional = true }
+rand = { version = "0.10.2", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "wayland", "x11"] }
 env_logger = "0.11.11"
-magictile-core.workspace = true
 png = "0.18.1"
-pollster = "1.0.1"
-r3.workspace = true
-rand = "0.10.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts"] }
+# WebGPU where browsers have it, WebGL2 everywhere else.
+wgpu = { version = "29", default-features = false, features = ["webgpu", "webgl"] }
+wasm-bindgen = "0.2.128"
+# #[wasm_bindgen] on an async fn expands to code that uses this.
+wasm-bindgen-futures = "0.4.55"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+console_error_panic_hook = "0.1.7"
+
+[[bin]]
+name = "magictile"
+path = "src/main.rs"
+required-features = ["puzzle"]
+
+[[bin]]
+name = "tiling"
+path = "src/bin/tiling.rs"

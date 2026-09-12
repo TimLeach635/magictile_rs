@@ -1,7 +1,7 @@
 //! wgpu rendering of [`DrawList`]s: into per-master cell textures, and into an offscreen view that
 //! is composited into the egui frame by a paint callback.
 
-use crate::scene::{Camera, Cmd, ColorVertex, DrawList, TexVertex};
+use crate::draw::{Camera, Cmd, ColorVertex, DrawList, TexVertex};
 use eframe::egui;
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu::{self, util::DeviceExt};
@@ -135,6 +135,8 @@ struct ViewTarget {
     size: [u32; 2],
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
+    /// Only read back for screenshots, which browsers do not do.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     resolve: wgpu::Texture,
     resolve_view: wgpu::TextureView,
     blit_bind_group: wgpu::BindGroup,
@@ -406,6 +408,7 @@ impl Renderer {
         self.draw(device, encoder, &job.view, &view.msaa, &view.resolve_view, &view.depth, Some(cell_bind_group));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Copies the rendered view into a buffer (rows padded to 256 bytes), for screenshots.
     pub fn copy_view(
         &self,
@@ -433,12 +436,14 @@ impl Renderer {
     }
 
     /// Reads back the last rendered view and saves it as a PNG (blocking).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_view_png(&self, device: &wgpu::Device, queue: &wgpu::Queue, path: &str) -> Result<(), String> {
         let pixels = self.read_view(device, queue)?;
         let [w, h] = self.view.as_ref().map_or([1, 1], |v| v.size);
-        crate::headless::write_png(path, [w.max(1), h.max(1)], &pixels)
+        write_png(path, [w.max(1), h.max(1)], &pixels)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Reads back the last rendered view as RGBA rows (blocking).
     pub fn read_view(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Vec<u8>, String> {
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -714,6 +719,17 @@ fn camera_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, came
     })
 }
 
+/// Saves pixels as a PNG.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_png(path: &str, size: [u32; 2], rgba: &[u8]) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), size[0], size[1]);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(rgba).map_err(|e| e.to_string())
+}
+
 impl CallbackTrait for PuzzleCallback {
     fn prepare(
         &self,
@@ -733,6 +749,7 @@ impl CallbackTrait for PuzzleCallback {
             let mut own = device.create_command_encoder(&Default::default());
             renderer.render_job(device, &mut own, &self.job);
             queue.submit([own.finish()]);
+            #[cfg(not(target_arch = "wasm32"))]
             if let Some(path) = crate::selftest::take_shot_request() {
                 let result = renderer.save_view_png(device, queue, &path);
                 eprintln!(

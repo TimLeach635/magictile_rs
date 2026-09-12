@@ -4,7 +4,8 @@ use eframe::egui::{self, PointerButton, Pos2, Rect};
 use r3::models::{self, HyperbolicModel, SphericalModel};
 use r3::{Geometry, Isometry, Mobius, Transform, Vector3D};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Which kind of drag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ impl Model {
         }
     }
 
+    #[cfg(feature = "puzzle")]
     pub fn is_hemisphere_disks(self) -> bool {
         self == Model::Spherical(SphericalModel::HemisphereDisks)
     }
@@ -165,6 +167,7 @@ impl View {
         model.to_standard(self.screen_to_model(x, y))
     }
 
+    #[cfg(feature = "puzzle")]
     /// Screen point to tiling coordinates (undoing the view isometry). `None` outside the
     /// Poincaré disk.
     pub fn space_coords_no_view(&mut self, model: Model, x: f32, y: f32) -> Option<Vector3D> {

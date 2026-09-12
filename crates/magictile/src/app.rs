@@ -694,7 +694,7 @@ impl MagicTileApp {
             closest_geodesic_seg: self.closest_geodesic_seg,
         };
 
-        let cell_jobs: Vec<(u32, scene::DrawList)> = if loaded.puzzle.is_spherical() {
+        let cell_jobs: Vec<(u32, crate::draw::DrawList)> = if loaded.puzzle.is_spherical() {
             Vec::new()
         } else {
             self.textures_valid

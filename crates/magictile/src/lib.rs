@@ -2,17 +2,25 @@
 //! plane and the hyperbolic plane, plus standalone hyperbolic tiling visualisations that share
 //! its rendering and navigation.
 
+#[cfg(feature = "puzzle")]
 mod app;
 mod cayley;
+mod draw;
+#[cfg(feature = "puzzle")]
 mod headless;
 mod render;
+#[cfg(feature = "puzzle")]
 mod scene;
 mod selftest;
+#[cfg(feature = "puzzle")]
 mod settings;
 pub mod tiling;
 mod view;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 /// The puzzle app.
+#[cfg(feature = "puzzle")]
 ///
 /// Usage: magictile [puzzle ID or display name]
 ///        magictile --screenshot out.png [options] [puzzle]   (see `headless.rs`)
@@ -32,6 +40,7 @@ pub fn run_puzzles() -> eframe::Result {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn native_options(title: &str) -> eframe::NativeOptions {
     let mut viewport = eframe::egui::ViewportBuilder::default().with_inner_size([1280.0, 860.0]).with_title(title);
     if selftest::active() {

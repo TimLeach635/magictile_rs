@@ -7,8 +7,8 @@
 //! Usage: tiling [p q]   (default 4 5)
 
 use crate::cayley::{Cayley, MAX_Q, Perm};
+use crate::draw::{self, Camera, DrawList};
 use crate::render::{FrameJob, PuzzleCallback, Renderer};
-use crate::scene::{self, Camera, DrawList};
 use crate::selftest::SelfTest;
 use crate::view::{Model, View};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke};
@@ -17,7 +17,7 @@ use r3::models::{HyperbolicModel, SphericalModel};
 use r3::{Complex, Geometry, Isometry, Mobius, Tiling, TilingConfig, Transform, Vector3D};
 use std::f64::consts::PI;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 const BACKGROUND: Color32 = Color32::WHITE;
 const BIG_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
@@ -198,7 +198,7 @@ impl TruncatedTiling {
         let pixel = 2.0 * view.view_scale / (view.height as f64 * pixels_per_point as f64);
         let mut list = DrawList::new(BACKGROUND, camera, pixel);
         // The far reaches of the tiling (beyond what we generate) are mostly 2p-gon.
-        scene::fill_hyperbolic_plane(&mut list, model, BIG_COLOR);
+        draw::fill_hyperbolic_plane(&mut list, model, BIG_COLOR);
 
         let screen = Screen { model, pixel, short_edge_px: self.short_edge_px };
         let start = list.solid.len() as u32;
@@ -635,7 +635,7 @@ impl TilingApp {
             if hops.len() > 1 {
                 painter.add(egui::Shape::line(hops.clone(), Stroke::new(3.5, PATH_COLOR)));
             }
-            straight = geodesic(at(m.from), at(m.nearest), 64).into_iter().filter_map(project).collect();
+            straight.extend(geodesic(at(m.from), at(m.nearest), 64).into_iter().filter_map(project));
             if straight.len() > 1 {
                 painter.add(egui::Shape::line(straight.clone(), Stroke::new(2.5, GEODESIC_COLOR)));
             }
@@ -757,6 +757,7 @@ impl TilingApp {
 
         // Self-test screenshots only capture the tiling itself, so write down what was drawn over
         // it (in image pixels) for checking afterwards.
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = crate::selftest::peek_shot_request() {
             let ppp = painter.ctx().pixels_per_point();
             let at = |p: Pos2| ((p.x - rect.min.x) * ppp, (p.y - rect.min.y) * ppp);
@@ -845,6 +846,7 @@ impl eframe::App for TilingApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Runs the tiling viewer: `tiling [p q]`.
 pub fn run() -> eframe::Result {
     let args: Vec<i32> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
