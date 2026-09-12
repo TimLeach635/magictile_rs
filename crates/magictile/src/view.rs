@@ -151,6 +151,15 @@ impl View {
         p
     }
 
+    /// Model coordinates to a screen point, the inverse of [`View::screen_to_model`].
+    pub fn model_to_screen(&self, mut p: Vector3D) -> (f32, f32) {
+        p.rotate_xy(self.rotation);
+        let aspect = self.width as f64 / self.height as f64;
+        let x = (p.x + aspect * self.view_scale) / (2.0 * aspect * self.view_scale) * self.width as f64;
+        let y = (self.view_scale - p.y) / (2.0 * self.view_scale) * self.height as f64;
+        (x as f32, y as f32)
+    }
+
     /// Screen point to the standard model (Poincaré disk / stereographic plane).
     pub fn screen_to_gl(&self, model: Model, x: f32, y: f32) -> Vector3D {
         model.to_standard(self.screen_to_model(x, y))

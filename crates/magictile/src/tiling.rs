@@ -6,11 +6,12 @@
 //!
 //! Usage: tiling [p q]   (default 4 5)
 
+use crate::cayley::{Cayley, MAX_Q, Perm};
 use crate::render::{FrameJob, PuzzleCallback, Renderer};
 use crate::scene::{self, Camera, DrawList};
 use crate::selftest::SelfTest;
 use crate::view::{Model, View};
-use eframe::egui::{self, Color32, Key, Sense};
+use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke};
 use eframe::egui_wgpu;
 use r3::models::{HyperbolicModel, SphericalModel};
 use r3::{Complex, Geometry, Isometry, Mobius, Tiling, TilingConfig, Transform, Vector3D};
@@ -30,6 +31,14 @@ const MIN_FACE_PX: f64 = 0.6;
 const MIN_LINE_PX: f64 = 0.3;
 /// Chords approximating curved edges stay within about this many pixels of the true edge.
 const MAX_SAG_PX: f64 = 0.15;
+/// Vertices with at least this much room between neighbors get their permutation written on.
+const LABEL_MIN_PX: f32 = 46.0;
+/// The mouse picks up a vertex within this many pixels, and never from further than half way to
+/// the vertex's neighbors (so crowded ones out near the rim don't grab the pointer).
+const HOVER_PX: f32 = 45.0;
+const LABEL_COLOR: Color32 = Color32::from_gray(15);
+const UNIT_COLOR: Color32 = Color32::from_gray(80);
+const HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(130, 0, 200);
 
 /// A face of the truncated tiling, in the Poincaré disk.
 struct Face {
@@ -63,6 +72,8 @@ pub struct TruncatedTiling {
     /// Edges shorter than this many pixels can't bend by more than [`MAX_SAG_PX`], so are drawn
     /// as single chords.
     short_edge_px: f64,
+    /// The tiling read as a Cayley graph, when t{p,q} can be one.
+    pub cayley: Option<Cayley>,
 }
 
 /// How the tiling maps to the screen this frame.
@@ -162,7 +173,15 @@ impl TruncatedTiling {
         let theta = ((edge - 2.0 * d) / 2.0).tanh().asin();
         let sag_ratio = (theta / 2.0).tan() / 2.0;
         let short_edge_px = MAX_SAG_PX / (1.25 * sag_ratio);
-        Ok(TruncatedTiling { p, q, faces, lines, homes, start, short_edge_px })
+
+        // The q-gons' corners (counterclockwise) and the edges between 2p-gons are the two kinds
+        // of step in the Cayley graph.
+        let q_gons: Vec<(Vector3D, Vec<Vector3D>)> =
+            faces.iter().filter(|f| f.color == SMALL_COLOR).map(|f| (f.center, f.vertices.clone())).collect();
+        let swaps: Vec<(Vector3D, Vector3D)> = lines.iter().map(|l| (l.a, l.b)).collect();
+        let cayley = Cayley::build(p, q, &q_gons, &swaps, &start);
+
+        Ok(TruncatedTiling { p, q, faces, lines, homes, start, short_edge_px, cayley })
     }
 
     /// Builds the frame's draw list. Also returns a symmetry recentering the view (see
@@ -203,10 +222,18 @@ impl TruncatedTiling {
         }
         list.push_solid(start..list.solid.len() as u32, false);
 
-        let closest = (0..self.homes.len()).min_by(|&a, &b| {
-            view.isometry.apply(self.homes[a].0).abs().total_cmp(&view.isometry.apply(self.homes[b].0).abs())
-        });
-        let recenter = closest.filter(|&i| i != 0).map(|i| self.homes[i].1.inverse());
+        // Without a labelling, any symmetry of the tiling will do to recenter; with one, the
+        // viewer recenters itself with a symmetry that carries the labels (see `TilingApp`).
+        let recenter = self
+            .cayley
+            .is_none()
+            .then(|| {
+                let closest = (0..self.homes.len()).min_by(|&a, &b| {
+                    view.isometry.apply(self.homes[a].0).abs().total_cmp(&view.isometry.apply(self.homes[b].0).abs())
+                });
+                closest.filter(|&i| i != 0).map(|i| self.homes[i].1.inverse())
+            })
+            .flatten();
         (list, recenter)
     }
 }
@@ -345,6 +372,11 @@ fn geodesic(a: Vector3D, b: Vector3D, n: usize) -> Vec<Vector3D> {
 pub struct TilingApp {
     tiling: TruncatedTiling,
     view: View,
+    /// The vertex under the mouse, if any.
+    hovered: Option<usize>,
+    /// Recentering renames the labels; this is the accumulated renaming (see
+    /// [`Cayley::frame_isometry`]).
+    frame: Perm,
     hyperbolic_model: HyperbolicModel,
     gliding: f64,
     last_frame: Instant,
@@ -356,12 +388,15 @@ impl TilingApp {
         if let Some(render_state) = &cc.wgpu_render_state {
             Renderer::install(render_state);
         }
+        let frame = tiling.cayley.as_ref().map_or([0; MAX_Q], |c| c.identity_perm());
         let mut view = View::default();
         view.reset(Geometry::Hyperbolic);
         view.isometry = tiling.start.clone();
         TilingApp {
             tiling,
             view,
+            hovered: None,
+            frame,
             hyperbolic_model: HyperbolicModel::Poincare,
             gliding: 0.5,
             last_frame: Instant::now(),
@@ -386,6 +421,9 @@ impl TilingApp {
         if reset {
             self.view.reset(Geometry::Hyperbolic);
             self.view.isometry = self.tiling.start.clone();
+            if let Some(cayley) = &self.tiling.cayley {
+                self.frame = cayley.identity_perm();
+            }
         }
     }
 
@@ -410,9 +448,18 @@ impl TilingApp {
         };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, PuzzleCallback { job: Arc::new(job) }));
 
+        let painter = ui.painter().with_clip_rect(rect);
+        let found = self.overlay(&painter, rect, model, response.hover_pos());
+        self.hovered = found.hovered;
+        self.recenter_onto(found.center);
+
         let help = format!(
-            "t{{{},{}}}   drag: pan   right drag / scroll: zoom   middle drag: rotate   F7: model ({:?})   R: reset",
-            self.tiling.p, self.tiling.q, self.hyperbolic_model
+            "t{{{},{}}}   drag: pan   right drag / scroll: zoom   middle drag: rotate   F7: model ({:?})   R: reset\
+             {}",
+            self.tiling.p,
+            self.tiling.q,
+            self.hyperbolic_model,
+            if self.tiling.cayley.is_some() { "   hover a vertex to find its copies" } else { "" }
         );
         ui.painter().text(
             rect.left_top() + egui::vec2(8.0, 6.0),
@@ -421,6 +468,211 @@ impl TilingApp {
             egui::FontId::proportional(13.0),
             Color32::from_gray(90),
         );
+    }
+}
+
+/// What the overlay picked out this frame.
+#[derive(Default, Clone, Copy)]
+struct Found {
+    hovered: Option<usize>,
+    /// The labelled vertex nearest the middle of the view, which recentering moves onto.
+    center: Option<usize>,
+}
+
+impl TilingApp {
+    /// Keeps the home vertex near the middle of the view: panning far otherwise loses precision
+    /// and runs off the end of the generated patch. The symmetry used carries the labelling with
+    /// it, so the permutations stay where they are on screen.
+    fn recenter_onto(&mut self, center: Option<usize>) {
+        let Some(cayley) = &self.tiling.cayley else { return };
+        let Some(vertex) = center.filter(|&v| v != cayley.home_vertex) else { return };
+        let (Some(symmetry), Some(label)) = (cayley.frame_isometry(vertex), cayley.label(vertex)) else { return };
+        self.view.isometry = &self.view.isometry * &symmetry;
+        self.frame = cayley.compose(&self.frame, &label);
+    }
+
+    /// Draws the Cayley graph overlay over the tiling: the repeating unit as a dotted outline,
+    /// the permutation at each vertex with room for it, and the hovered vertex together with its
+    /// copies in the other units. Returns the hovered vertex.
+    fn overlay(&self, painter: &egui::Painter, rect: Rect, model: Model, pointer: Option<Pos2>) -> Found {
+        let Some(cayley) = self.tiling.cayley.as_ref() else { return Found::default() };
+        let view = &self.view;
+        let project = |p: Vector3D| -> Option<Pos2> {
+            let disk = view.isometry.apply(p);
+            if disk.abs() > 0.9995 {
+                return None;
+            }
+            let projected = model.apply(disk);
+            if projected.is_dne() {
+                return None;
+            }
+            let (x, y) = view.model_to_screen(projected);
+            let pos = rect.min + egui::vec2(x, y);
+            (pos.x.is_finite() && pos.y.is_finite()).then_some(pos)
+        };
+
+        // Where every vertex sits on screen (just off screen too, so labels don't pop in).
+        let margin = rect.expand(40.0);
+        let screen: Vec<Option<Pos2>> =
+            cayley.vertices.iter().map(|v| project(v.pos).filter(|p| margin.contains(*p))).collect();
+        // How much room a vertex has, from the distance to a neighbor.
+        let room = |i: usize| -> f32 {
+            let neighbor = cayley.vertices[i].neighbor();
+            match (screen[i], neighbor.and_then(|n| screen[n])) {
+                (Some(a), Some(b)) => a.distance(b),
+                _ => 0.0,
+            }
+        };
+
+        // The vertices showing the identity permutation mark the copies of the repeating unit;
+        // outline the one nearest the middle of the view.
+        let middle = rect.center();
+        let showing_identity = cayley.inverse_of(&self.frame);
+        let nearest_unit = cayley
+            .vertices_with_label(&showing_identity)
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let from_middle = |v: usize| view.isometry.apply(cayley.vertices[v].pos).abs();
+                from_middle(a).total_cmp(&from_middle(b))
+            })
+            .and_then(|v| cayley.frame_isometry(v));
+        let mut unit: Vec<Vec<Pos2>> = Vec::new();
+        if let Some(g) = nearest_unit {
+            let corners: Vec<Vector3D> = cayley.unit.iter().map(|&c| g.apply(c)).collect();
+            for i in 0..corners.len() {
+                let side = geodesic(corners[i], corners[(i + 1) % corners.len()], 16);
+                let points: Vec<Pos2> = side.into_iter().filter_map(project).collect();
+                if points.len() > 1 {
+                    unit.push(points);
+                }
+            }
+        }
+        for side in &unit {
+            painter.extend(egui::Shape::dashed_line(side, Stroke::new(1.5, UNIT_COLOR), 5.0, 4.0));
+        }
+
+        // The vertex under the mouse, and the one nearest the middle for recentering.
+        let mut center = None;
+        let mut nearest_middle = f32::MAX;
+        for (i, pos) in screen.iter().enumerate() {
+            if let Some(pos) = pos
+                && cayley.vertices[i].label.is_some()
+                && pos.distance(middle) < nearest_middle
+            {
+                nearest_middle = pos.distance(middle);
+                center = Some(i);
+            }
+        }
+
+        let mut hovered = None;
+        if let Some(pointer) = pointer {
+            let mut closest = HOVER_PX;
+            for (i, pos) in screen.iter().enumerate() {
+                if let Some(pos) = pos
+                    && cayley.vertices[i].label.is_some()
+                    && pos.distance(pointer) < closest.min(room(i) * 0.5)
+                {
+                    closest = pos.distance(pointer);
+                    hovered = Some(i);
+                }
+            }
+        }
+        let mut highlights: Vec<(Pos2, f32, bool)> = Vec::new();
+        if let Some(h) = hovered {
+            for &copy in cayley.copies_of(h) {
+                let Some(pos) = screen[copy] else { continue };
+                highlights.push((pos, (room(copy) * 0.16).clamp(4.0, 13.0), copy == h));
+            }
+        }
+        for &(pos, radius, is_hovered) in &highlights {
+            painter.circle(pos, radius, HIGHLIGHT_COLOR, Stroke::new(1.5, Color32::WHITE));
+            if is_hovered {
+                painter.circle_stroke(pos, radius + 4.0, Stroke::new(2.0, HIGHLIGHT_COLOR));
+            }
+        }
+
+        // The permutations themselves, wherever there is room.
+        let mut labels: Vec<(usize, Pos2, f32, String)> = Vec::new();
+        for (i, pos) in screen.iter().enumerate() {
+            let (Some(pos), Some(word)) = (pos, cayley.label_word(i, &self.frame)) else { continue };
+            let room = room(i);
+            if room < LABEL_MIN_PX {
+                continue;
+            }
+            labels.push((i, *pos, (room * 0.24).clamp(11.0, 26.0), word));
+        }
+        for (i, pos, size, word) in &labels {
+            // The vertices sit where a q-gon, two 2p-gons and an edge meet, so back the text to
+            // keep it readable whatever is behind it.
+            let galley = painter.layout_no_wrap(word.clone(), egui::FontId::monospace(*size), LABEL_COLOR);
+            let backing = egui::Rect::from_center_size(*pos, galley.size()).expand(*size * 0.12);
+            let hovered_here = Some(*i) == hovered;
+            let (fill, text) = if hovered_here {
+                (HIGHLIGHT_COLOR, Color32::WHITE)
+            } else {
+                (Color32::from_white_alpha(205), LABEL_COLOR)
+            };
+            painter.rect_filled(backing, *size * 0.2, fill);
+            painter.galley(*pos - galley.size() / 2.0, galley, text);
+        }
+
+        // A readout, for when the hovered vertex is too small to carry its own label.
+        let readout = hovered.and_then(|h| {
+            Some(format!("{}   {}", cayley.label_word(h, &self.frame)?, cayley.label_cycles(h, &self.frame)?))
+        });
+        if let Some(text) = &readout {
+            let at = rect.left_bottom() + egui::vec2(10.0, -10.0);
+            let galley = painter.layout_no_wrap(text.clone(), egui::FontId::monospace(20.0), LABEL_COLOR);
+            let box_rect =
+                egui::Rect::from_min_size(at - egui::vec2(-4.0, galley.size().y + 4.0), galley.size()).expand(6.0);
+            painter.rect_filled(box_rect, 4.0, Color32::from_white_alpha(220));
+            painter.galley(at - egui::vec2(-10.0, galley.size().y), galley, LABEL_COLOR);
+        }
+
+        // Self-test screenshots only capture the tiling itself, so write down what was drawn over
+        // it (in image pixels) for checking afterwards.
+        if let Some(path) = crate::selftest::peek_shot_request() {
+            let ppp = painter.ctx().pixels_per_point();
+            let at = |p: Pos2| ((p.x - rect.min.x) * ppp, (p.y - rect.min.y) * ppp);
+            let points = |ps: &Vec<Pos2>| {
+                ps.iter()
+                    .map(|&p| {
+                        let (x, y) = at(p);
+                        format!("[{x:.1},{y:.1}]")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let json = format!(
+                "{{\"pointer\":{},\"labels\":[{}],\"unit\":[{}],\"highlights\":[{}],\"readout\":{}}}",
+                pointer.map_or("null".into(), |p| {
+                    let (x, y) = at(p);
+                    format!("[{x:.1},{y:.1}]")
+                }),
+                labels
+                    .iter()
+                    .map(|(_, p, size, word)| {
+                        let (x, y) = at(*p);
+                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"size\":{:.1},\"word\":\"{word}\"}}", size * ppp)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                unit.iter().map(|side| format!("[{}]", points(side))).collect::<Vec<_>>().join(","),
+                highlights
+                    .iter()
+                    .map(|(p, r, hovered)| {
+                        let (x, y) = at(*p);
+                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"r\":{:.1},\"hovered\":{hovered}}}", r * ppp)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                readout.map_or("null".into(), |t| format!("\"{t}\""))
+            );
+            let _ = std::fs::write(format!("{path}.json"), json);
+        }
+
+        Found { hovered, center }
     }
 }
 

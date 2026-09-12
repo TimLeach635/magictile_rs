@@ -3,6 +3,7 @@
 //! its rendering and navigation.
 
 mod app;
+mod cayley;
 mod headless;
 mod render;
 mod scene;

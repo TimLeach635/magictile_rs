@@ -122,6 +122,11 @@ pub fn active() -> bool {
     *ACTIVE.get_or_init(|| std::env::var_os("MAGICTILE_SELFTEST").is_some())
 }
 
+/// The screenshot about to be taken this frame, without claiming it.
+pub fn peek_shot_request() -> Option<String> {
+    SHOT_REQUEST.lock().unwrap().clone()
+}
+
 pub fn take_shot_request() -> Option<String> {
     SHOT_REQUEST.lock().unwrap().take()
 }
