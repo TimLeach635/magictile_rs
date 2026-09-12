@@ -558,8 +558,26 @@ impl TilingApp {
         let Some(cayley) = &self.tiling.cayley else { return };
         let Some(vertex) = center.filter(|&v| v != cayley.home_vertex) else { return };
         let (Some(symmetry), Some(label)) = (cayley.frame_isometry(vertex), cayley.label(vertex)) else { return };
+        let frame = cayley.compose(&self.frame, &label);
+
+        // Vertex indices are in tiling coordinates, which this symmetry moves, so anything held
+        // that way has to come along: otherwise a measurement would jump to the vertices the
+        // picked ones land on. Dropped if a picked vertex lands outside the patch.
+        let inverse = symmetry.inverse();
+        let carried: Vec<usize> = self
+            .picked
+            .iter()
+            .filter_map(|&v| {
+                let moved = inverse.apply(cayley.vertices[v].pos);
+                cayley.nearest(moved).filter(|&n| cayley.vertices[n].pos.dist(moved) < 1e-9)
+            })
+            .collect();
+        let keep = carried.len() == self.picked.len();
+
         self.view.isometry = &self.view.isometry * &symmetry;
-        self.frame = cayley.compose(&self.frame, &label);
+        self.frame = frame;
+        self.picked = if keep { carried } else { Vec::new() };
+        self.measurement = self.measure();
     }
 
     /// Draws the Cayley graph overlay over the tiling: the repeating unit as a dotted outline,
