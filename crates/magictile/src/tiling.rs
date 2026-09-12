@@ -39,6 +39,10 @@ const HOVER_PX: f32 = 45.0;
 const LABEL_COLOR: Color32 = Color32::from_gray(15);
 const UNIT_COLOR: Color32 = Color32::from_gray(80);
 const HIGHLIGHT_COLOR: Color32 = Color32::from_rgb(130, 0, 200);
+/// The straight hyperbolic line between two picked vertices.
+const GEODESIC_COLOR: Color32 = Color32::from_rgb(0, 140, 70);
+/// The route through the graph, hop by hop.
+const PATH_COLOR: Color32 = Color32::from_rgb(255, 110, 0);
 
 /// A face of the truncated tiling, in the Poincaré disk.
 struct Face {
@@ -369,9 +373,32 @@ fn geodesic(a: Vector3D, b: Vector3D, n: usize) -> Vec<Vector3D> {
     (0..=n).map(|k| Vector3D::from_complex(from_origin(ac, w * ((half * k as f64 / n as f64).tanh() / r)))).collect()
 }
 
+/// A measurement between two picked vertices.
+struct Measurement {
+    from: usize,
+    to: usize,
+    /// The copy of `to` nearest `from`: the same vertex, unless the short way wraps around.
+    nearest: usize,
+    /// Hyperbolic distance to that nearest copy, and to the vertex actually picked.
+    shortest: f64,
+    direct: f64,
+    /// A shortest route through the graph, and its length in steps.
+    path: Vec<usize>,
+    hops: usize,
+}
+
+impl Measurement {
+    fn wraps(&self) -> bool {
+        self.nearest != self.to
+    }
+}
+
 pub struct TilingApp {
     tiling: TruncatedTiling,
     view: View,
+    /// The vertices picked for measuring, and what they measure.
+    picked: Vec<usize>,
+    measurement: Option<Measurement>,
     /// The vertex under the mouse, if any.
     hovered: Option<usize>,
     /// Recentering renames the labels; this is the accumulated renaming (see
@@ -395,6 +422,8 @@ impl TilingApp {
         TilingApp {
             tiling,
             view,
+            picked: Vec::new(),
+            measurement: None,
             hovered: None,
             frame,
             hyperbolic_model: HyperbolicModel::Poincare,
@@ -408,8 +437,40 @@ impl TilingApp {
         Model::for_puzzle(Geometry::Hyperbolic, self.hyperbolic_model, SphericalModel::Sterographic)
     }
 
+    /// Picks a vertex to measure from, then one to measure to; a third pick starts again.
+    fn pick(&mut self, vertex: Option<usize>) {
+        let (Some(vertex), true) = (vertex, self.tiling.cayley.is_some()) else { return };
+        if self.picked.len() >= 2 {
+            self.picked.clear();
+        }
+        self.picked.push(vertex);
+        self.measurement = self.measure();
+    }
+
+    /// The distance between the two picked vertices, both across the surface (allowing the short
+    /// way to wrap around to a copy) and directly between the two as drawn.
+    fn measure(&self) -> Option<Measurement> {
+        let cayley = self.tiling.cayley.as_ref()?;
+        let (&from, &to) = (self.picked.first()?, self.picked.get(1)?);
+        let nearest = cayley.nearest_copy(from, to)?;
+        let path = cayley.hop_path(from, to)?;
+        Some(Measurement {
+            from,
+            to,
+            nearest,
+            shortest: cayley.distance(from, nearest),
+            direct: cayley.distance(from, to),
+            hops: path.len() - 1,
+            path,
+        })
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let (f7, reset) = ctx.input(|i| (i.key_pressed(Key::F7), i.key_pressed(Key::R)));
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.picked.clear();
+            self.measurement = None;
+        }
         if f7 {
             self.hyperbolic_model = match self.hyperbolic_model {
                 HyperbolicModel::Poincare => HyperbolicModel::Klein,
@@ -421,6 +482,8 @@ impl TilingApp {
         if reset {
             self.view.reset(Geometry::Hyperbolic);
             self.view.isometry = self.tiling.start.clone();
+            self.picked.clear();
+            self.measurement = None;
             if let Some(cayley) = &self.tiling.cayley {
                 self.frame = cayley.identity_perm();
             }
@@ -451,6 +514,10 @@ impl TilingApp {
         let painter = ui.painter().with_clip_rect(rect);
         let found = self.overlay(&painter, rect, model, response.hover_pos());
         self.hovered = found.hovered;
+        if response.clicked() {
+            self.pick(found.hovered);
+            ctx.request_repaint();
+        }
         self.recenter_onto(found.center);
 
         let help = format!(
@@ -459,7 +526,11 @@ impl TilingApp {
             self.tiling.p,
             self.tiling.q,
             self.hyperbolic_model,
-            if self.tiling.cayley.is_some() { "   hover a vertex to find its copies" } else { "" }
+            if self.tiling.cayley.is_some() {
+                "   hover a vertex to find its copies   click two to measure (Esc clears)"
+            } else {
+                ""
+            }
         );
         ui.painter().text(
             rect.left_top() + egui::vec2(8.0, 6.0),
@@ -552,6 +623,33 @@ impl TilingApp {
             painter.extend(egui::Shape::dashed_line(side, Stroke::new(1.5, UNIT_COLOR), 5.0, 4.0));
         }
 
+        // The measurement: the straight hyperbolic line to the nearest copy, and the route
+        // through the graph that the hop count counts.
+        let mut measured: Vec<(Pos2, Color32, bool)> = Vec::new();
+        let (mut hops, mut straight): (Vec<Pos2>, Vec<Pos2>) = (Vec::new(), Vec::new());
+        if let Some(m) = &self.measurement {
+            let at = |v: usize| cayley.vertices[v].pos;
+            for step in m.path.windows(2) {
+                hops.extend(geodesic(at(step[0]), at(step[1]), 6).into_iter().filter_map(project));
+            }
+            if hops.len() > 1 {
+                painter.add(egui::Shape::line(hops.clone(), Stroke::new(3.5, PATH_COLOR)));
+            }
+            straight = geodesic(at(m.from), at(m.nearest), 64).into_iter().filter_map(project).collect();
+            if straight.len() > 1 {
+                painter.add(egui::Shape::line(straight.clone(), Stroke::new(2.5, GEODESIC_COLOR)));
+            }
+            // Mark where the measurement runs from and to, and the copy it reaches if it wrapped.
+            measured.push((project(at(m.from)).unwrap_or(middle), GEODESIC_COLOR, true));
+            measured.push((project(at(m.to)).unwrap_or(middle), GEODESIC_COLOR, !m.wraps()));
+            if m.wraps() {
+                measured.push((project(at(m.nearest)).unwrap_or(middle), PATH_COLOR, true));
+            }
+        } else {
+            for &v in &self.picked {
+                measured.push((project(cayley.vertices[v].pos).unwrap_or(middle), GEODESIC_COLOR, true));
+            }
+        }
         // The vertex under the mouse, and the one nearest the middle for recentering.
         let mut center = None;
         let mut nearest_middle = f32::MAX;
@@ -617,17 +715,44 @@ impl TilingApp {
             painter.galley(*pos - galley.size() / 2.0, galley, text);
         }
 
-        // A readout, for when the hovered vertex is too small to carry its own label.
-        let readout = hovered.and_then(|h| {
-            Some(format!("{}   {}", cayley.label_word(h, &self.frame)?, cayley.label_cycles(h, &self.frame)?))
-        });
-        if let Some(text) = &readout {
-            let at = rect.left_bottom() + egui::vec2(10.0, -10.0);
-            let galley = painter.layout_no_wrap(text.clone(), egui::FontId::monospace(20.0), LABEL_COLOR);
-            let box_rect =
-                egui::Rect::from_min_size(at - egui::vec2(-4.0, galley.size().y + 4.0), galley.size()).expand(6.0);
+        // Markers last: a label's backing would otherwise hide which vertices were picked, and
+        // when the short way wraps, the hollow marker is the only sign of where it was headed.
+        for &(pos, color, filled) in &measured {
+            if filled {
+                painter.circle(pos, 8.0, color, Stroke::new(2.0, Color32::WHITE));
+            } else {
+                painter.circle_stroke(pos, 9.0, Stroke::new(3.0, color));
+                painter.circle_stroke(pos, 12.0, Stroke::new(1.5, Color32::WHITE));
+            }
+        }
+
+        // Readouts along the bottom: the measurement, then the hovered vertex.
+        let mut readout: Vec<String> = Vec::new();
+        if let Some(m) = &self.measurement
+            && let (Some(from), Some(to)) =
+                (cayley.label_word(m.from, &self.frame), cayley.label_word(m.to, &self.frame))
+        {
+            let edges = m.shortest / cayley.edge_length();
+            readout.push(format!(
+                "{from} to {to}:  {:.3} ({edges:.1} edges), {} hops{}",
+                m.shortest,
+                m.hops,
+                if m.wraps() { format!("   wraps around; {:.3} the way you picked", m.direct) } else { String::new() }
+            ));
+        }
+        if let Some(h) = hovered
+            && let (Some(word), Some(cycles)) = (cayley.label_word(h, &self.frame), cayley.label_cycles(h, &self.frame))
+        {
+            readout.push(format!("{word}   {cycles}"));
+        }
+        let mut bottom = rect.left_bottom() + egui::vec2(10.0, -10.0);
+        for line in &readout {
+            let galley = painter.layout_no_wrap(line.clone(), egui::FontId::monospace(20.0), LABEL_COLOR);
+            let size = galley.size();
+            let box_rect = egui::Rect::from_min_size(bottom - egui::vec2(4.0, size.y), size).expand(6.0);
             painter.rect_filled(box_rect, 4.0, Color32::from_white_alpha(220));
-            painter.galley(at - egui::vec2(-10.0, galley.size().y), galley, LABEL_COLOR);
+            painter.galley(bottom - egui::vec2(0.0, size.y), galley, LABEL_COLOR);
+            bottom.y -= size.y + 10.0;
         }
 
         // Self-test screenshots only capture the tiling itself, so write down what was drawn over
@@ -645,7 +770,7 @@ impl TilingApp {
                     .join(",")
             };
             let json = format!(
-                "{{\"pointer\":{},\"labels\":[{}],\"unit\":[{}],\"highlights\":[{}],\"readout\":{}}}",
+                "{{\"pointer\":{},\"labels\":[{}],\"unit\":[{}],\"highlights\":[{}],\"readout\":{},\"measure\":{}}}",
                 pointer.map_or("null".into(), |p| {
                     let (x, y) = at(p);
                     format!("[{x:.1},{y:.1}]")
@@ -667,7 +792,27 @@ impl TilingApp {
                     })
                     .collect::<Vec<_>>()
                     .join(","),
-                readout.map_or("null".into(), |t| format!("\"{t}\""))
+                readout.first().map_or("null".into(), |t| format!("\"{t}\"")),
+                self.measurement.as_ref().map_or("null".into(), |m| {
+                    format!(
+                        "{{\"hops\":{},\"shortest\":{:.6},\"direct\":{:.6},\"wraps\":{},\"steps\":{},\"geodesic\":[{}],\"path\":[{}],\"marks\":[{}]}}",
+                        m.hops,
+                        m.shortest,
+                        m.direct,
+                        m.wraps(),
+                        m.path.len(),
+                        points(&straight),
+                        points(&hops),
+                        measured
+                            .iter()
+                            .map(|(p, _, filled)| {
+                                let (x, y) = at(*p);
+                                format!("{{\"x\":{x:.1},\"y\":{y:.1},\"filled\":{filled}}}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                })
             );
             let _ = std::fs::write(format!("{path}.json"), json);
         }

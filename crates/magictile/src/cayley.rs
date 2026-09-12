@@ -130,6 +130,8 @@ pub struct Cayley {
     pub unit: Vec<Vector3D>,
     /// Symmetries carrying the home unit onto each copy (the identity first).
     pub deck: Vec<Isometry>,
+    /// The length of one edge of the tiling.
+    edge: f64,
     by_label: HashMap<Perm, Vec<usize>>,
 }
 
@@ -225,7 +227,8 @@ impl Cayley {
         }
 
         let unit = dirichlet(center, &copies[1..]);
-        Some(Cayley { q, vertices, home_vertex: first, center, unit, deck, by_label })
+        let edge = vertices[first].across.map_or(0.0, |n| hyperbolic_distance(vertices[first].pos, vertices[n].pos));
+        Some(Cayley { q, vertices, home_vertex: first, center, unit, deck, edge, by_label })
     }
 
     /// Every vertex carrying the same permutation as this one (itself included).
@@ -287,6 +290,65 @@ impl Cayley {
     /// The vertex at a point, if there is one (within rounding).
     pub fn nearest(&self, p: Vector3D) -> Option<usize> {
         (0..self.vertices.len()).min_by(|&a, &b| self.vertices[a].pos.dist(p).total_cmp(&self.vertices[b].pos.dist(p)))
+    }
+
+    /// The length of one edge of the tiling, for reporting distances in edges.
+    pub fn edge_length(&self) -> f64 {
+        self.edge
+    }
+
+    pub fn distance(&self, a: usize, b: usize) -> f64 {
+        hyperbolic_distance(self.vertices[a].pos, self.vertices[b].pos)
+    }
+
+    /// The copy of `vertex` nearest `from`. Identical vertices repeat once per unit, so the
+    /// shortest way between two of them on the surface may run to a copy rather than the one
+    /// picked.
+    pub fn nearest_copy(&self, from: usize, vertex: usize) -> Option<usize> {
+        self.copies_of(vertex)
+            .iter()
+            .copied()
+            .min_by(|&a, &b| self.distance(from, a).total_cmp(&self.distance(from, b)))
+    }
+
+    /// A shortest route through the graph from `from` to any copy of `vertex`, as the chain of
+    /// vertices passed through. Its number of steps is the distance in the group: reaching *any*
+    /// copy means spelling `label(from)` inverse times `label(vertex)` out of the generators, so
+    /// this is that permutation's word length.
+    pub fn hop_path(&self, from: usize, vertex: usize) -> Option<Vec<usize>> {
+        let target = self.label(vertex)?;
+        if self.label(from)? == target {
+            return Some(vec![from]);
+        }
+        let mut came_from: HashMap<usize, usize> = HashMap::new();
+        let mut queue = std::collections::VecDeque::from([from]);
+        came_from.insert(from, from);
+        while let Some(v) = queue.pop_front() {
+            for next in self.neighbors(v) {
+                if came_from.contains_key(&next) {
+                    continue;
+                }
+                came_from.insert(next, v);
+                if self.label(next) == Some(target) {
+                    let mut path = vec![next];
+                    while *path.last().unwrap() != from {
+                        path.push(came_from[path.last().unwrap()]);
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                queue.push_back(next);
+            }
+        }
+        None
+    }
+
+    /// The vertices one step away: around the q-gon both ways, and across to the next q-gon.
+    fn neighbors(&self, vertex: usize) -> Vec<usize> {
+        [self.vertices[vertex].next, self.vertices[vertex].across, back_link(&self.vertices, vertex)]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// How many distinct permutations the labelling used.
@@ -557,6 +619,74 @@ mod tests {
             }
         }
         assert!(checked > 300, "only checked {checked} vertices");
+    }
+
+    /// Walking the graph to *any* copy of the target is the same as spelling the permutation out
+    /// of the generators, so the hop count must match the word length in S_q, worked out here
+    /// independently by a search over the group itself.
+    #[test]
+    fn hop_counts_match_the_word_metric() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+
+        let (cyc, swp) = (cycle(c.q), swap(c.q));
+        let generators = [cyc, inverse(&cyc, c.q), swp];
+        let mut lengths: HashMap<Perm, usize> = HashMap::from([(identity(c.q), 0)]);
+        let mut queue = std::collections::VecDeque::from([identity(c.q)]);
+        while let Some(g) = queue.pop_front() {
+            for s in &generators {
+                let h = mul(&g, s, c.q);
+                if !lengths.contains_key(&h) {
+                    lengths.insert(h, lengths[&g] + 1);
+                    queue.push_back(h);
+                }
+            }
+        }
+        assert_eq!(lengths.len(), 120);
+        assert_eq!(*lengths.values().max().unwrap(), 10, "S5 with these generators has diameter 10");
+
+        let near: Vec<usize> =
+            (0..c.vertices.len()).filter(|&v| c.vertices[v].pos.abs() < 0.5 && c.label(v).is_some()).collect();
+        let mut checked = 0;
+        for &a in &near {
+            for &b in &near {
+                let path = c.hop_path(a, b).expect("a route should exist");
+                let expected = lengths[&mul(&inverse(&c.label(a).unwrap(), c.q), &c.label(b).unwrap(), c.q)];
+                assert_eq!(path.len() - 1, expected, "hops from {a} to {b}");
+                // The route is a real one: each step is an edge, and it ends on a copy.
+                for step in path.windows(2) {
+                    assert!(c.neighbors(step[0]).contains(&step[1]), "step {step:?} is not an edge");
+                }
+                assert_eq!(c.label(*path.last().unwrap()), c.label(b));
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "only checked {checked} pairs");
+    }
+
+    /// The nearest copy is never further than the vertex actually picked, and for vertices far
+    /// enough apart it is genuinely nearer — the shortest way between them wraps around.
+    #[test]
+    fn the_nearest_copy_is_at_most_as_far() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+        let within = |limit: f64| {
+            (0..c.vertices.len())
+                .filter(|&v| c.vertices[v].pos.abs() < limit && c.label(v).is_some())
+                .collect::<Vec<_>>()
+        };
+        let (middle, wider) = (within(0.4), within(0.95));
+        let mut wrapped = 0;
+        for &a in middle.iter().take(30) {
+            for &b in &wider {
+                let nearest = c.nearest_copy(a, b).unwrap();
+                assert!(c.distance(a, nearest) <= c.distance(a, b) + 1e-9);
+                if nearest != b {
+                    wrapped += 1;
+                }
+            }
+        }
+        assert!(wrapped > 0, "some pairs should be closer to a copy than to the vertex picked");
     }
 
     #[test]
