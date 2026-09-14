@@ -100,10 +100,9 @@ nearest, so the marker does not hop between equally good answers.
   on every frame.
 - An unconfirmed distance would be shown as "at most", with a note that the pair is too near the
   edge of the tiling to rule out a shorter way.
-- Recentering carries only the picked vertices across, not the measurement. A picked vertex carried
-  beyond the patch, or onto an unlabelled vertex at its edge, is still dropped, and the measurement
-  with it. Since measuring needs only each end's label and position, keeping picks that have left
-  the patch would be possible, but is not done yet.
+- Recentering carries only the picked vertices across, not the measurement. Since measuring needs
+  only each pick's label and position, picks are followed beyond the patch: see
+  [ADR 0002](0002-follow-picks-beyond-the-patch.md).
 - Tests:
   - `measurements_far_out_are_confirmed`: pairs out to 4.5 from the origin are all confirmed; they
     agree with the in-place search wherever that is confirmed too, the nearest copy sits at the

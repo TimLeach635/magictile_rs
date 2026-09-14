@@ -140,12 +140,29 @@ pub struct Route {
     pub path: Vec<usize>,
 }
 
+/// A vertex picked for measuring, from [`Cayley::pick`]: its label, where it is in tiling
+/// coordinates, and where the next vertex around its q-gon is, which fixes its orientation. Unlike
+/// a vertex index, it can be followed beyond the generated patch.
+#[derive(Clone, Copy)]
+pub struct Pick {
+    pub label: Perm,
+    pub pos: Vector3D,
+    next: Vector3D,
+}
+
+/// How far from the origin a pick can be carried before rounding would swamp its position.
+const PICK_REACH: f64 = 12.0;
+
 /// How far apart two vertices are on the surface, from [`Cayley::measure`].
 pub struct Distance {
     /// Where the nearest copy of the second vertex is, in tiling coordinates. It may lie beyond
     /// the generated patch.
     pub nearest: Vector3D,
+    /// Whether the nearest copy is somewhere other than the second vertex itself.
+    pub wraps: bool,
     pub length: f64,
+    /// The distance straight to the second vertex, as drawn.
+    pub direct: f64,
     /// Whether `length` is certainly the shortest; if not, it is an upper bound.
     pub confirmed: bool,
     /// The number of steps along a shortest route through the graph, which is exact.
@@ -399,29 +416,69 @@ impl Cayley {
         Some(Nearest { vertex, distance, confirmed })
     }
 
-    /// The shortest distance on the surface from `from` to `to`, and a shortest route.
+    /// A vertex picked for measuring.
+    pub fn pick(&self, vertex: usize) -> Option<Pick> {
+        let v = &self.vertices[vertex];
+        Some(Pick { label: v.label?, pos: v.pos, next: self.vertices[v.next?].pos })
+    }
+
+    /// Where `pick` is once the view recenters onto `onto` (see [`Cayley::frame_isometry`]): moved
+    /// by the inverse of that symmetry, and relabelled by `label(onto)⁻¹` on the left, so that it
+    /// still shows the same permutation. It is followed off the generated patch, and settles back
+    /// onto a vertex whenever it lands on one, which clears the rounding it gathered on the way.
+    /// `None` once it is so far out that rounding would swamp it.
+    pub fn carry(&self, pick: &Pick, onto: usize) -> Option<Pick> {
+        let back = self.frame_isometry(onto)?.inverse();
+        let label = mul(&inverse(&self.label(onto)?, self.q), &pick.label, self.q);
+        let pos = back.apply(pick.pos);
+        if !(2.0 * pos.abs().atanh() <= PICK_REACH) {
+            return None;
+        }
+        let landed = self
+            .nearest(pos)
+            .filter(|&v| self.vertices[v].pos.dist(pos) < 1e-6 && self.vertices[v].label == Some(label))
+            .and_then(|v| self.pick(v));
+        Some(landed.unwrap_or(Pick { label, pos, next: back.apply(pick.next) }))
+    }
+
+    /// The symmetry taking the home vertex onto `pick`, as [`Cayley::frame_isometry`] does for a
+    /// vertex.
+    fn placing(&self, pick: &Pick) -> Option<Isometry> {
+        let home = &self.vertices[self.home_vertex];
+        Some(matching_isometry(home.pos, self.vertices[home.next?].pos, pick.pos, pick.next))
+    }
+
+    /// The permutation `label` shows in a view recentered by `frame`, in one-line form.
+    pub fn word_of(&self, label: &Perm, frame: &Perm) -> String {
+        word(&mul(frame, label, self.q), self.q)
+    }
+
+    /// The shortest distance on the surface from `from` to `to`, and a shortest route. Neither
+    /// pick has to be within the generated patch.
     ///
-    /// The search is done where the generated patch is widest, around the home vertex. Undoing
-    /// the symmetry that takes the home vertex onto `from` relabels every `x` as
-    /// `label(from)⁻¹ x`, so the copies of `to` become the vertices labelled
-    /// `label(from)⁻¹ label(to)` around the home vertex; the results are carried back. A pair of
-    /// vertices far out in the patch is then confirmed as readily as a pair in the middle. Where
-    /// copies tie for nearest, the one at `prefer` wins.
-    pub fn measure(&self, from: usize, to: usize, prefer: Option<Vector3D>) -> Option<Distance> {
-        let goal = mul(&inverse(&self.label(from)?, self.q), &self.label(to)?, self.q);
-        let back = self.frame_isometry(from)?;
+    /// The search is done where the patch is widest, around the home vertex. Undoing the symmetry
+    /// that takes the home vertex onto `from` relabels every `x` as `label(from)⁻¹ x`, so the
+    /// copies of `to` become the vertices labelled `label(from)⁻¹ label(to)` around the home
+    /// vertex; the results are carried back. A pair far out is then confirmed as readily as a pair
+    /// in the middle. Where copies tie for nearest, the one at `prefer` wins.
+    pub fn measure(&self, from: &Pick, to: &Pick, prefer: Option<Vector3D>) -> Option<Distance> {
+        let goal = mul(&inverse(&from.label, self.q), &to.label, self.q);
+        let back = self.placing(from)?;
         let there = back.inverse();
         let (home, target) = (self.home_vertex, *self.vertices_with_label(&goal).first()?);
         let prefer = prefer.and_then(|p| {
             let p = there.apply(p);
             self.nearest(p).filter(|&v| self.vertices[v].pos.dist(p) < 1e-6)
         });
-        let nearest = self.nearest_copy(home, target, prefer)?;
+        let nearest_copy = self.nearest_copy(home, target, prefer)?;
         let route = self.route(home, target)?;
+        let nearest = back.apply(self.vertices[nearest_copy.vertex].pos);
         Some(Distance {
-            nearest: back.apply(self.vertices[nearest.vertex].pos),
-            length: nearest.distance,
-            confirmed: nearest.confirmed,
+            nearest,
+            wraps: hyperbolic_distance(nearest, to.pos) > 1e-6,
+            length: nearest_copy.distance,
+            direct: hyperbolic_distance(from.pos, to.pos),
+            confirmed: nearest_copy.confirmed,
             hops: route.hops,
             path: route.path.iter().map(|&v| back.apply(self.vertices[v].pos)).collect(),
         })
@@ -921,7 +978,7 @@ mod tests {
         let (mut confirmed, mut total, mut in_place_unconfirmed, mut compared) = (0, 0, 0, 0);
         for &a in out.iter().step_by(23) {
             for &b in out.iter().step_by(23) {
-                let m = c.measure(a, b, None).unwrap();
+                let m = c.measure(&c.pick(a).unwrap(), &c.pick(b).unwrap(), None).unwrap();
                 let in_place = c.nearest_copy(a, b, None).unwrap();
                 total += 1;
                 assert_eq!(m.hops, c.route(a, b).unwrap().hops, "hops from {a} to {b}");
@@ -947,6 +1004,57 @@ mod tests {
         assert!(confirmed * 100 >= total * 99, "only {confirmed}/{total} confirmed");
         assert!(in_place_unconfirmed > 0, "these pairs should reach the patch's edge when searched in place");
         assert!(compared > 50, "only {compared} compared");
+    }
+
+    /// Panning a long way in one direction carries picks off the generated patch. They are
+    /// followed there: they keep showing the same permutations, and the measurement between them
+    /// stays the same confirmed distance, until they are too far out to follow.
+    #[test]
+    fn picks_are_followed_beyond_the_patch() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+        let from_origin = |p: Vector3D| 2.0 * p.abs().atanh();
+        let off_patch = |p: Vector3D| c.nearest(p).is_none_or(|v| c.vertices[v].pos.dist(p) > 1e-6);
+        let near: Vec<usize> = (0..c.vertices.len())
+            .filter(|&v| v != c.home_vertex && c.label(v).is_some() && c.vertices[v].pos.abs() < 0.5)
+            .collect();
+        // A recentering which, repeated, carries things steadily outwards rather than round in a
+        // circle, as panning in one direction does.
+        let onto = *near
+            .iter()
+            .find(|&&v| {
+                let back = c.frame_isometry(v).unwrap().inverse();
+                from_origin((0..6).fold(c.vertices[c.home_vertex].pos, |p, _| back.apply(p))) > 5.0
+            })
+            .expect("a recentering that carries things outwards");
+
+        let mut picks = [c.pick(near[0]).unwrap(), c.pick(near[near.len() / 2]).unwrap()];
+        let mut frame = c.identity_perm();
+        let shows = picks.map(|p| c.word_of(&p.label, &frame));
+        let first = c.measure(&picks[0], &picks[1], None).unwrap();
+        assert!(first.confirmed);
+
+        let (mut steps, mut beyond) = (0, 0);
+        while let (Some(p0), Some(p1)) = (c.carry(&picks[0], onto), c.carry(&picks[1], onto)) {
+            picks = [p0, p1];
+            frame = c.compose(&frame, &c.label(onto).unwrap());
+            steps += 1;
+            assert!(steps < 1000, "the picks never went out of reach");
+            assert_eq!(picks.map(|p| c.word_of(&p.label, &frame)), shows, "step {steps}");
+            let m = c.measure(&picks[0], &picks[1], None).unwrap();
+            assert!(m.confirmed, "step {steps}");
+            assert!((m.length - first.length).abs() < 1e-6, "step {steps}: {} became {}", first.length, m.length);
+            assert!((m.direct - first.direct).abs() < 1e-6, "step {steps}: {} became {}", first.direct, m.direct);
+            assert_eq!(m.hops, first.hops, "step {steps}");
+            if picks.iter().all(|p| off_patch(p.pos)) {
+                beyond += 1;
+            }
+        }
+        println!("followed for {steps} steps, {beyond} with both picks beyond the patch, out to {:.2}", {
+            let last = picks.map(|p| from_origin(p.pos));
+            last[0].max(last[1])
+        });
+        assert!(beyond > 0, "the picks never left the patch in {steps} steps");
     }
 
     #[test]
