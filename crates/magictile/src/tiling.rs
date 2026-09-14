@@ -183,7 +183,19 @@ impl TruncatedTiling {
         let q_gons: Vec<(Vector3D, Vec<Vector3D>)> =
             faces.iter().filter(|f| f.color == SMALL_COLOR).map(|f| (f.center, f.vertices.clone())).collect();
         let swaps: Vec<(Vector3D, Vector3D)> = lines.iter().map(|l| (l.a, l.b)).collect();
-        let cayley = Cayley::build(p, q, &q_gons, &swaps, &start);
+        // How far apart two vertices of one face can be. Every point lies in some face, and so
+        // within this of each of that face's vertices, which is what lets the Cayley graph confirm
+        // that no nearer copy lies beyond the generated patch. Faces of a kind are congruent, so
+        // measure those nearest the origin, where rounding is least.
+        let diameter = |f: &Face| {
+            f.vertices.iter().flat_map(|&a| f.vertices.iter().map(move |&b| distance(a, b))).fold(0.0, f64::max)
+        };
+        let central = |color: Color32| {
+            faces.iter().filter(|f| f.color == color).min_by(|a, b| a.center.abs().total_cmp(&b.center.abs()))
+        };
+        let face_diameter =
+            [central(BIG_COLOR), central(SMALL_COLOR)].into_iter().flatten().map(diameter).fold(0.0, f64::max);
+        let cayley = Cayley::build(p, q, &q_gons, &swaps, &start, face_diameter);
 
         Ok(TruncatedTiling { p, q, faces, lines, homes, start, short_edge_px, cayley })
     }
@@ -377,20 +389,20 @@ fn geodesic(a: Vector3D, b: Vector3D, n: usize) -> Vec<Vector3D> {
 struct Measurement {
     from: usize,
     to: usize,
-    /// The copy of `to` nearest `from`: the same vertex, unless the short way wraps around.
-    nearest: usize,
+    /// Where the copy of `to` nearest `from` is: at `to`, unless the short way wraps around. It
+    /// may lie beyond the generated patch.
+    nearest: Vector3D,
+    wraps: bool,
     /// Hyperbolic distance to that nearest copy, and to the vertex actually picked.
     shortest: f64,
     direct: f64,
-    /// A shortest route through the graph, and its length in steps.
-    path: Vec<usize>,
+    /// Whether `shortest` is certainly the shortest. If not, a nearer copy may lie beyond the
+    /// generated patch, and it is only an upper bound.
+    confirmed: bool,
+    /// A shortest route through the graph as far as it could be traced, and its length in steps
+    /// (exact either way).
+    path: Vec<Vector3D>,
     hops: usize,
-}
-
-impl Measurement {
-    fn wraps(&self) -> bool {
-        self.nearest != self.to
-    }
 }
 
 pub struct TilingApp {
@@ -444,24 +456,26 @@ impl TilingApp {
             self.picked.clear();
         }
         self.picked.push(vertex);
-        self.measurement = self.measure();
+        self.measurement = self.measure(None);
     }
 
     /// The distance between the two picked vertices, both across the surface (allowing the short
     /// way to wrap around to a copy) and directly between the two as drawn.
-    fn measure(&self) -> Option<Measurement> {
+    /// Where copies tie for nearest, the one at `marked` is kept if it is one of them.
+    fn measure(&self, marked: Option<Vector3D>) -> Option<Measurement> {
         let cayley = self.tiling.cayley.as_ref()?;
         let (&from, &to) = (self.picked.first()?, self.picked.get(1)?);
-        let nearest = cayley.nearest_copy(from, to)?;
-        let path = cayley.hop_path(from, to)?;
+        let distance = cayley.measure(from, to, marked)?;
         Some(Measurement {
             from,
             to,
-            nearest,
-            shortest: cayley.distance(from, nearest),
+            nearest: distance.nearest,
+            wraps: distance.nearest.dist(cayley.vertices[to].pos) > 1e-6,
+            shortest: distance.length,
             direct: cayley.distance(from, to),
-            hops: path.len() - 1,
-            path,
+            confirmed: distance.confirmed,
+            path: distance.path,
+            hops: distance.hops,
         })
     }
 
@@ -564,20 +578,19 @@ impl TilingApp {
         // that way has to come along: otherwise a measurement would jump to the vertices the
         // picked ones land on. Dropped if a picked vertex lands outside the patch.
         let inverse = symmetry.inverse();
-        let carried: Vec<usize> = self
-            .picked
-            .iter()
-            .filter_map(|&v| {
-                let moved = inverse.apply(cayley.vertices[v].pos);
-                cayley.nearest(moved).filter(|&n| cayley.vertices[n].pos.dist(moved) < 1e-9)
-            })
-            .collect();
+        let carry = |v: usize| cayley.transport(&inverse, v);
+        let carried: Vec<usize> = self.picked.iter().filter_map(|&v| carry(v)).collect();
         let keep = carried.len() == self.picked.len();
+
+        // The measurement is worked out again. Copies often tie exactly for nearest, with nothing
+        // between them but vertex index, which this symmetry permutes; keeping the copy already
+        // marked stops the marker hopping between equally good answers.
+        let marked = self.measurement.as_ref().map(|m| inverse.apply(m.nearest));
 
         self.view.isometry = &self.view.isometry * &symmetry;
         self.frame = frame;
         self.picked = if keep { carried } else { Vec::new() };
-        self.measurement = self.measure();
+        self.measurement = self.measure(marked);
     }
 
     /// Draws the Cayley graph overlay over the tiling: the repeating unit as a dotted outline,
@@ -648,20 +661,20 @@ impl TilingApp {
         if let Some(m) = &self.measurement {
             let at = |v: usize| cayley.vertices[v].pos;
             for step in m.path.windows(2) {
-                hops.extend(geodesic(at(step[0]), at(step[1]), 6).into_iter().filter_map(project));
+                hops.extend(geodesic(step[0], step[1], 6).into_iter().filter_map(project));
             }
             if hops.len() > 1 {
                 painter.add(egui::Shape::line(hops.clone(), Stroke::new(3.5, PATH_COLOR)));
             }
-            straight.extend(geodesic(at(m.from), at(m.nearest), 64).into_iter().filter_map(project));
+            straight.extend(geodesic(at(m.from), m.nearest, 64).into_iter().filter_map(project));
             if straight.len() > 1 {
                 painter.add(egui::Shape::line(straight.clone(), Stroke::new(2.5, GEODESIC_COLOR)));
             }
             // Mark where the measurement runs from and to, and the copy it reaches if it wrapped.
             measured.push((project(at(m.from)).unwrap_or(middle), GEODESIC_COLOR, true));
-            measured.push((project(at(m.to)).unwrap_or(middle), GEODESIC_COLOR, !m.wraps()));
-            if m.wraps() {
-                measured.push((project(at(m.nearest)).unwrap_or(middle), PATH_COLOR, true));
+            measured.push((project(at(m.to)).unwrap_or(middle), GEODESIC_COLOR, !m.wraps));
+            if m.wraps {
+                measured.push((project(m.nearest).unwrap_or(middle), PATH_COLOR, true));
             }
         } else {
             for &v in &self.picked {
@@ -751,11 +764,13 @@ impl TilingApp {
                 (cayley.label_word(m.from, &self.frame), cayley.label_word(m.to, &self.frame))
         {
             let edges = m.shortest / cayley.edge_length();
+            let at_most = if m.confirmed { "" } else { "at most " };
             readout.push(format!(
-                "{from} to {to}:  {:.3} ({edges:.1} edges), {} hops{}",
+                "{from} to {to}:  {at_most}{:.3} ({edges:.1} edges), {} hops{}{}",
                 m.shortest,
                 m.hops,
-                if m.wraps() { format!("   wraps around; {:.3} the way you picked", m.direct) } else { String::new() }
+                if m.wraps { format!("   wraps around; {:.3} the way you picked", m.direct) } else { String::new() },
+                if m.confirmed { "" } else { "   (too near the edge of the tiling to rule out a shorter way)" }
             ));
         }
         if let Some(h) = hovered
@@ -814,11 +829,12 @@ impl TilingApp {
                 readout.first().map_or("null".into(), |t| format!("\"{t}\"")),
                 self.measurement.as_ref().map_or("null".into(), |m| {
                     format!(
-                        "{{\"hops\":{},\"shortest\":{:.6},\"direct\":{:.6},\"wraps\":{},\"steps\":{},\"geodesic\":[{}],\"path\":[{}],\"marks\":[{}]}}",
+                        "{{\"hops\":{},\"shortest\":{:.6},\"direct\":{:.6},\"confirmed\":{},\"wraps\":{},\"steps\":{},\"geodesic\":[{}],\"path\":[{}],\"marks\":[{}]}}",
                         m.hops,
                         m.shortest,
                         m.direct,
-                        m.wraps(),
+                        m.confirmed,
+                        m.wraps,
                         m.path.len(),
                         points(&straight),
                         points(&hops),

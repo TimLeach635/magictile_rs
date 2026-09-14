@@ -119,6 +119,49 @@ impl Vertex {
     }
 }
 
+/// Distances this close are the same distance, told apart only by rounding.
+const TIE: f64 = 1e-9;
+
+/// The copy of a vertex nearest another, from [`Cayley::nearest_copy`].
+pub struct Nearest {
+    pub vertex: usize,
+    pub distance: f64,
+    /// Whether this is certainly the shortest distance. If not, a nearer copy may lie beyond the
+    /// generated patch, and `distance` is only an upper bound.
+    pub confirmed: bool,
+}
+
+/// A shortest route through the graph, from [`Cayley::route`].
+pub struct Route {
+    /// Its length in steps, which is exact: the word length in the group.
+    pub hops: usize,
+    /// The vertices it passes through, from the start. It stops early if the route runs off the
+    /// generated patch.
+    pub path: Vec<usize>,
+}
+
+/// How far apart two vertices are on the surface, from [`Cayley::measure`].
+pub struct Distance {
+    /// Where the nearest copy of the second vertex is, in tiling coordinates. It may lie beyond
+    /// the generated patch.
+    pub nearest: Vector3D,
+    pub length: f64,
+    /// Whether `length` is certainly the shortest; if not, it is an upper bound.
+    pub confirmed: bool,
+    /// The number of steps along a shortest route through the graph, which is exact.
+    pub hops: usize,
+    /// The route's vertices in tiling coordinates, as far as it could be traced.
+    pub path: Vec<Vector3D>,
+}
+
+/// A step through the graph: around the q-gon either way, or across to the next one.
+#[derive(Clone, Copy)]
+enum Generator {
+    Cycle,
+    Swap,
+    Back,
+}
+
 pub struct Cayley {
     pub q: usize,
     pub vertices: Vec<Vertex>,
@@ -133,18 +176,24 @@ pub struct Cayley {
     /// The length of one edge of the tiling.
     edge: f64,
     by_label: HashMap<Perm, Vec<usize>>,
+    /// The labelled vertices missing a neighbor: where the generated patch stops.
+    incomplete: Vec<usize>,
+    /// The furthest apart two vertices of one face are.
+    face_diameter: f64,
 }
 
 impl Cayley {
     /// Labels the vertices of a truncated tiling. `q_gons` are the q-gons' centers with their
-    /// corners in counterclockwise order, and `swaps` the edges between 2p-gons. Returns `None`
-    /// when the labelling can't be consistent (see the module comment).
+    /// corners in counterclockwise order, `swaps` the edges between 2p-gons, and `face_diameter`
+    /// the furthest apart two vertices of one face are. Returns `None` when the labelling can't be
+    /// consistent (see the module comment).
     pub fn build(
         p: i32,
         q: i32,
         q_gons: &[(Vector3D, Vec<Vector3D>)],
         swaps: &[(Vector3D, Vector3D)],
         start: &Isometry,
+        face_diameter: f64,
     ) -> Option<Cayley> {
         let q = q as usize;
         if !(3..=MAX_Q).contains(&q) || p % (q as i32 - 1) != 0 {
@@ -208,6 +257,12 @@ impl Cayley {
                 by_label.entry(label).or_default().push(i);
             }
         }
+        let incomplete = (0..vertices.len())
+            .filter(|&v| {
+                vertices[v].label.is_some()
+                    && (vertices[v].next.is_none() || vertices[v].across.is_none() || back_link(&vertices, v).is_none())
+            })
+            .collect();
 
         // The deck transformations are the label-preserving symmetries: each carries the home
         // q-gon onto another q-gon holding the same labels, matching them up.
@@ -228,7 +283,18 @@ impl Cayley {
 
         let unit = dirichlet(center, &copies[1..]);
         let edge = vertices[first].across.map_or(0.0, |n| hyperbolic_distance(vertices[first].pos, vertices[n].pos));
-        Some(Cayley { q, vertices, home_vertex: first, center, unit, deck, edge, by_label })
+        Some(Cayley {
+            q,
+            vertices,
+            home_vertex: first,
+            center,
+            unit,
+            deck,
+            edge,
+            by_label,
+            incomplete,
+            face_diameter: face_diameter + 1e-6,
+        })
     }
 
     /// Every vertex carrying the same permutation as this one (itself included).
@@ -292,6 +358,16 @@ impl Cayley {
         (0..self.vertices.len()).min_by(|&a, &b| self.vertices[a].pos.dist(p).total_cmp(&self.vertices[b].pos.dist(p)))
     }
 
+    /// The vertex a symmetry carries `vertex` onto, if it lands within the generated patch.
+    ///
+    /// Vertex indices are in tiling coordinates, which recentering moves, so anything held that
+    /// way has to be carried across. Landing on an unlabelled vertex, out where the patch runs
+    /// out, counts as leaving it.
+    pub fn transport(&self, by: &Isometry, vertex: usize) -> Option<usize> {
+        let moved = by.apply(self.vertices[vertex].pos);
+        self.nearest(moved).filter(|&n| self.vertices[n].pos.dist(moved) < 1e-9 && self.vertices[n].label.is_some())
+    }
+
     /// The length of one edge of the tiling, for reporting distances in edges.
     pub fn edge_length(&self) -> f64 {
         self.edge
@@ -303,47 +379,110 @@ impl Cayley {
 
     /// The copy of `vertex` nearest `from`. Identical vertices repeat once per unit, so the
     /// shortest way between two of them on the surface may run to a copy rather than the one
-    /// picked.
-    pub fn nearest_copy(&self, from: usize, vertex: usize) -> Option<usize> {
-        self.copies_of(vertex)
-            .iter()
-            .copied()
-            .min_by(|&a, &b| self.distance(from, a).total_cmp(&self.distance(from, b)))
+    /// picked. Where copies tie for nearest, `prefer` wins if it is one of them.
+    ///
+    /// Only the copies in the generated patch can be searched, so the answer says whether it is
+    /// confirmed (see `adrs/0001-confirmed-shortest-distances.md`). Suppose a copy nearer than the
+    /// one found, at distance `R`, were missing. The faces along the geodesic out to it would link
+    /// `from` to it through the graph without going further than `R` plus a face's diameter, and
+    /// the last vertex along that path the patch does hold would be missing a neighbor. So if no
+    /// such vertex is that close, nothing nearer is missing.
+    pub fn nearest_copy(&self, from: usize, vertex: usize, prefer: Option<usize>) -> Option<Nearest> {
+        let copies = self.copies_of(vertex);
+        let distance = copies.iter().map(|&c| self.distance(from, c)).fold(f64::INFINITY, f64::min);
+        let tied = |c: usize| self.distance(from, c) <= distance + TIE;
+        let vertex = prefer
+            .filter(|p| copies.contains(p) && tied(*p))
+            .or_else(|| copies.iter().copied().find(|&c| tied(c)))?;
+        let reach = distance + self.face_diameter;
+        let confirmed = self.incomplete.iter().all(|&v| self.distance(from, v) > reach);
+        Some(Nearest { vertex, distance, confirmed })
     }
 
-    /// A shortest route through the graph from `from` to any copy of `vertex`, as the chain of
-    /// vertices passed through. Its number of steps is the distance in the group: reaching *any*
+    /// The shortest distance on the surface from `from` to `to`, and a shortest route.
+    ///
+    /// The search is done where the generated patch is widest, around the home vertex. Undoing
+    /// the symmetry that takes the home vertex onto `from` relabels every `x` as
+    /// `label(from)⁻¹ x`, so the copies of `to` become the vertices labelled
+    /// `label(from)⁻¹ label(to)` around the home vertex; the results are carried back. A pair of
+    /// vertices far out in the patch is then confirmed as readily as a pair in the middle. Where
+    /// copies tie for nearest, the one at `prefer` wins.
+    pub fn measure(&self, from: usize, to: usize, prefer: Option<Vector3D>) -> Option<Distance> {
+        let goal = mul(&inverse(&self.label(from)?, self.q), &self.label(to)?, self.q);
+        let back = self.frame_isometry(from)?;
+        let there = back.inverse();
+        let (home, target) = (self.home_vertex, *self.vertices_with_label(&goal).first()?);
+        let prefer = prefer.and_then(|p| {
+            let p = there.apply(p);
+            self.nearest(p).filter(|&v| self.vertices[v].pos.dist(p) < 1e-6)
+        });
+        let nearest = self.nearest_copy(home, target, prefer)?;
+        let route = self.route(home, target)?;
+        Some(Distance {
+            nearest: back.apply(self.vertices[nearest.vertex].pos),
+            length: nearest.distance,
+            confirmed: nearest.confirmed,
+            hops: route.hops,
+            path: route.path.iter().map(|&v| back.apply(self.vertices[v].pos)).collect(),
+        })
+    }
+
+    /// A shortest route through the graph from `from` to any copy of `vertex`. Reaching *any*
     /// copy means spelling `label(from)` inverse times `label(vertex)` out of the generators, so
-    /// this is that permutation's word length.
-    pub fn hop_path(&self, from: usize, vertex: usize) -> Option<Vec<usize>> {
-        let target = self.label(vertex)?;
-        if self.label(from)? == target {
-            return Some(vec![from]);
+    /// the route is a shortest word for that permutation. It is found by searching the group
+    /// itself rather than the tiling, so the hop count is exact however much of the tiling was
+    /// generated; only the drawn path can run out.
+    pub fn route(&self, from: usize, vertex: usize) -> Option<Route> {
+        let (start, target) = (self.label(from)?, self.label(vertex)?);
+        let word = self.shortest_word(&mul(&inverse(&start, self.q), &target, self.q));
+        let mut path = vec![from];
+        for step in &word {
+            let at = *path.last().unwrap();
+            let next = match step {
+                Generator::Cycle => self.vertices[at].next,
+                Generator::Swap => self.vertices[at].across,
+                Generator::Back => back_link(&self.vertices, at),
+            };
+            let Some(next) = next else { break };
+            path.push(next);
         }
-        let mut came_from: HashMap<usize, usize> = HashMap::new();
-        let mut queue = std::collections::VecDeque::from([from]);
-        came_from.insert(from, from);
-        while let Some(v) = queue.pop_front() {
-            for next in self.neighbors(v) {
-                if came_from.contains_key(&next) {
-                    continue;
+        Some(Route { hops: word.len(), path })
+    }
+
+    /// A shortest word for `goal` in the generators, by breadth-first search of the group. The
+    /// generators are tried in the order the graph's neighbors are, so this is the route a search
+    /// of an unbounded tiling would find.
+    fn shortest_word(&self, goal: &Perm) -> Vec<Generator> {
+        let q = self.q;
+        let generators = [(cycle(q), Generator::Cycle), (swap(q), Generator::Swap), (inverse(&cycle(q), q), Generator::Back)];
+        let start = identity(q);
+        let mut came_from: HashMap<Perm, (Perm, Generator)> = HashMap::new();
+        let mut queue = std::collections::VecDeque::from([start]);
+        while let Some(g) = queue.pop_front() {
+            if g == *goal {
+                break;
+            }
+            for &(s, generator) in &generators {
+                let h = mul(&g, &s, q);
+                if h != start && !came_from.contains_key(&h) {
+                    came_from.insert(h, (g, generator));
+                    queue.push_back(h);
                 }
-                came_from.insert(next, v);
-                if self.label(next) == Some(target) {
-                    let mut path = vec![next];
-                    while *path.last().unwrap() != from {
-                        path.push(came_from[path.last().unwrap()]);
-                    }
-                    path.reverse();
-                    return Some(path);
-                }
-                queue.push_back(next);
             }
         }
-        None
+        let mut word = Vec::new();
+        let mut at = *goal;
+        while at != start {
+            let (previous, generator) = came_from[&at];
+            word.push(generator);
+            at = previous;
+        }
+        word.reverse();
+        word
     }
 
     /// The vertices one step away: around the q-gon both ways, and across to the next q-gon.
+    #[cfg(test)]
     fn neighbors(&self, vertex: usize) -> Vec<usize> {
         [self.vertices[vertex].next, self.vertices[vertex].across, back_link(&self.vertices, vertex)]
             .into_iter()
@@ -650,7 +789,9 @@ mod tests {
         let mut checked = 0;
         for &a in &near {
             for &b in &near {
-                let path = c.hop_path(a, b).expect("a route should exist");
+                let route = c.route(a, b).expect("a route should exist");
+                assert_eq!(route.path.len(), route.hops + 1, "the route from {a} to {b} should stay in the patch");
+                let path = route.path;
                 let expected = lengths[&mul(&inverse(&c.label(a).unwrap(), c.q), &c.label(b).unwrap(), c.q)];
                 assert_eq!(path.len() - 1, expected, "hops from {a} to {b}");
                 // The route is a real one: each step is an edge, and it ends on a copy.
@@ -679,7 +820,7 @@ mod tests {
         let mut wrapped = 0;
         for &a in middle.iter().take(30) {
             for &b in &wider {
-                let nearest = c.nearest_copy(a, b).unwrap();
+                let nearest = c.nearest_copy(a, b, None).unwrap().vertex;
                 assert!(c.distance(a, nearest) <= c.distance(a, b) + 1e-9);
                 if nearest != b {
                     wrapped += 1;
@@ -687,6 +828,125 @@ mod tests {
             }
         }
         assert!(wrapped > 0, "some pairs should be closer to a copy than to the vertex picked");
+    }
+
+    /// A confirmed shortest distance is the true one wherever it is worked out. The same pair of
+    /// vertices is moved about by recentering symmetries, from the middle of the generated patch
+    /// out towards its edge: every confirmed answer must agree, and an unconfirmed one, which is
+    /// only an upper bound, must never undercut them. Before distances were confirmed, the viewer
+    /// reported 2.9387 for a pair 2.6211 apart once panning had carried the nearer copy off the
+    /// patch.
+    #[test]
+    fn confirmed_distances_agree_wherever_they_are_measured() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+        let labelled = |limit: f64| {
+            let mut vs: Vec<usize> =
+                (0..c.vertices.len()).filter(|&v| c.vertices[v].pos.abs() < limit && c.label(v).is_some()).collect();
+            vs.sort_by(|&a, &b| c.vertices[a].pos.abs().total_cmp(&c.vertices[b].pos.abs()));
+            vs
+        };
+        // Recentering onto vertices spread from the middle outwards, so each pair is measured both
+        // with plenty of patch around it and with very little.
+        let all = labelled(1.0);
+        let ontos: Vec<usize> = all.iter().copied().step_by(all.len() / 16).collect();
+        let (near, far) = (labelled(0.3), labelled(0.9));
+
+        let (mut confirmed, mut unconfirmed) = (0, 0);
+        for &a in near.iter().take(8) {
+            for &b in far.iter().step_by(7) {
+                let (mut truth, mut bounds): (Option<f64>, Vec<f64>) = (None, Vec::new());
+                for &onto in &ontos {
+                    let Some(symmetry) = c.frame_isometry(onto) else { continue };
+                    let inverse = symmetry.inverse();
+                    let (Some(a2), Some(b2)) = (c.transport(&inverse, a), c.transport(&inverse, b)) else { continue };
+                    let nearest = c.nearest_copy(a2, b2, None).unwrap();
+                    if nearest.confirmed {
+                        confirmed += 1;
+                        let truth = *truth.get_or_insert(nearest.distance);
+                        assert!((nearest.distance - truth).abs() < 1e-7, "confirmed both {} and {truth}", nearest.distance);
+                    } else {
+                        unconfirmed += 1;
+                        bounds.push(nearest.distance);
+                    }
+                }
+                if let Some(truth) = truth {
+                    for bound in bounds {
+                        assert!(bound > truth - 1e-7, "an unconfirmed {bound} undercut the confirmed {truth}");
+                    }
+                }
+            }
+        }
+        println!("{confirmed} confirmed, {unconfirmed} unconfirmed");
+        assert!(confirmed > 100 && unconfirmed > 0, "{confirmed} confirmed, {unconfirmed} unconfirmed: the check needs both");
+    }
+
+    /// Where copies tie for nearest, the one already marked stays marked, so the marker holds still
+    /// while the view pans.
+    #[test]
+    fn ties_go_to_the_copy_already_marked() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+        let labelled: Vec<usize> =
+            (0..c.vertices.len()).filter(|&v| c.vertices[v].pos.abs() < 0.9 && c.label(v).is_some()).collect();
+        let mut ties = 0;
+        for &a in labelled.iter().take(10) {
+            for &b in &labelled {
+                let best = c.nearest_copy(a, b, None).unwrap().distance;
+                let tied: Vec<usize> =
+                    c.copies_of(b).iter().copied().filter(|&v| c.distance(a, v) <= best + 1e-9).collect();
+                if tied.len() < 2 {
+                    continue;
+                }
+                for &marked in &tied {
+                    assert_eq!(c.nearest_copy(a, b, Some(marked)).unwrap().vertex, marked);
+                }
+                ties += 1;
+            }
+        }
+        assert!(ties > 0, "no ties to check");
+    }
+
+    /// Measuring is done around the home vertex, so pairs far out in the patch, where a search in
+    /// place runs into the patch's edge, are confirmed as readily as pairs in the middle. Whenever
+    /// both are confirmed they agree, and the nearest copy sits where the distance says.
+    #[test]
+    fn measurements_far_out_are_confirmed() {
+        let t = TruncatedTiling::new(4, 5).unwrap();
+        let c = t.cayley.as_ref().unwrap();
+        let from_origin = |v: usize| 2.0 * c.vertices[v].pos.abs().atanh();
+        let out: Vec<usize> =
+            (0..c.vertices.len()).filter(|&v| c.label(v).is_some() && from_origin(v) < 4.5).collect();
+
+        let (mut confirmed, mut total, mut in_place_unconfirmed, mut compared) = (0, 0, 0, 0);
+        for &a in out.iter().step_by(23) {
+            for &b in out.iter().step_by(23) {
+                let m = c.measure(a, b, None).unwrap();
+                let in_place = c.nearest_copy(a, b, None).unwrap();
+                total += 1;
+                assert_eq!(m.hops, c.route(a, b).unwrap().hops, "hops from {a} to {b}");
+                assert!(
+                    (hyperbolic_distance(c.vertices[a].pos, m.nearest) - m.length).abs() < 1e-6,
+                    "the nearest copy of {b} is not {} from {a}",
+                    m.length
+                );
+                if !in_place.confirmed {
+                    in_place_unconfirmed += 1;
+                }
+                if m.confirmed {
+                    confirmed += 1;
+                    assert!(m.length <= in_place.distance + 1e-7, "a confirmed {} beaten in place by {}", m.length, in_place.distance);
+                    if in_place.confirmed {
+                        assert!((m.length - in_place.distance).abs() < 1e-7);
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        println!("{confirmed}/{total} confirmed ({in_place_unconfirmed} would not be in place), {compared} compared");
+        assert!(confirmed * 100 >= total * 99, "only {confirmed}/{total} confirmed");
+        assert!(in_place_unconfirmed > 0, "these pairs should reach the patch's edge when searched in place");
+        assert!(compared > 50, "only {compared} compared");
     }
 
     #[test]
