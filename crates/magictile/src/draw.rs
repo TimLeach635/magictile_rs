@@ -201,9 +201,20 @@ impl DrawList {
 
     /// A polyline's triangles, without a command to draw them (for batching).
     pub(crate) fn polyline_triangles(&mut self, points: &[Vector3D], width_px: f64, color: Color32) -> Range<u32> {
+        self.stroke(points, width_px, color, false)
+    }
+
+    /// A polyline's triangles, cut square at its first and last points, for lines that meet
+    /// others there.
+    pub(crate) fn open_polyline_triangles(&mut self, points: &[Vector3D], width_px: f64, color: Color32) -> Range<u32> {
+        self.stroke(points, width_px, color, true)
+    }
+
+    fn stroke(&mut self, points: &[Vector3D], width_px: f64, color: Color32, square_ends: bool) -> Range<u32> {
         let half = width_px * self.pixel / 2.0;
+        let segments = points.len().saturating_sub(1);
         let mut tris = Vec::new();
-        for w in points.windows(2) {
+        for (i, w) in points.windows(2).enumerate() {
             let (a, b) = (w[0], w[1]);
             if a.is_dne() || b.is_dne() || infinity::is_infinite(a) || infinity::is_infinite(b) {
                 continue;
@@ -215,9 +226,58 @@ impl DrawList {
             // Extend a little along the segment so joints don't show gaps.
             let along = d * half;
             let n = Vector3D::new(-d.y, d.x) * half;
-            let (a, b) = (a - along, b + along);
+            let a = if square_ends && i == 0 { a } else { a - along };
+            let b = if square_ends && i + 1 == segments { b } else { b + along };
             tris.extend([a + n, a - n, b + n, b + n, a - n, b - n]);
         }
+        self.solid_triangles(tris, color)
+    }
+
+    /// The outline of a closed polygon, with a width in pixels, mitred so its corners meet
+    /// cleanly. `ring` repeats its first point at the end.
+    pub(crate) fn outline_triangles(&mut self, ring: &[Vector3D], width_px: f64, color: Color32) -> Range<u32> {
+        let half = width_px * self.pixel / 2.0;
+        let mut points: Vec<Vector3D> = Vec::with_capacity(ring.len());
+        for &p in ring {
+            if points.last().is_none_or(|last| last.dist(p) > 1e-12) {
+                points.push(p);
+            }
+        }
+        if points.len() > 1 && points[0].dist(points[points.len() - 1]) <= 1e-12 {
+            points.pop();
+        }
+        let n = points.len();
+        if n < 3 || points.iter().any(|p| p.is_dne() || infinity::is_infinite(*p)) {
+            return self.solid_triangles(std::iter::empty(), color);
+        }
+        let normal = |a: Vector3D, b: Vector3D| {
+            let mut d = b - a;
+            d.normalize();
+            Vector3D::new(-d.y, d.x)
+        };
+        let sides: Vec<Vector3D> = (0..n).map(|i| normal(points[i], points[(i + 1) % n])).collect();
+        let corners: Vec<(Vector3D, Vector3D)> = (0..n)
+            .map(|i| {
+                let (before, after) = (sides[(i + n - 1) % n], sides[i]);
+                let mut miter = before + after;
+                // The miter is longer by one over the cosine of half the turn; sharp turns are
+                // capped so they don't spike.
+                let cos = if miter.normalize() {
+                    (miter.x * after.x + miter.y * after.y).max(0.5)
+                } else {
+                    miter = after;
+                    1.0
+                };
+                let offset = miter * (half / cos);
+                (points[i] + offset, points[i] - offset)
+            })
+            .collect();
+        let tris: Vec<Vector3D> = (0..n)
+            .flat_map(|i| {
+                let (a, b) = (corners[i], corners[(i + 1) % n]);
+                [a.0, a.1, b.0, b.0, a.1, b.1]
+            })
+            .collect();
         self.solid_triangles(tris, color)
     }
 }
@@ -259,6 +319,13 @@ pub fn rgba(c: Color32) -> [f32; 4] {
 
 /// Fills the whole hyperbolic plane as it appears in a model.
 pub(crate) fn fill_hyperbolic_plane(list: &mut DrawList, model: Model, color: Color32) {
+    let range = plane_triangles(list, model, color);
+    list.push_solid(range, false);
+}
+
+/// Triangles covering the whole hyperbolic plane as it appears in a model, without a command to
+/// draw them.
+pub(crate) fn plane_triangles(list: &mut DrawList, model: Model, color: Color32) -> Range<u32> {
     match model {
         Model::Hyperbolic(HyperbolicModel::UpperHalfPlane) | Model::Hyperbolic(HyperbolicModel::Orthographic) => {
             let big = 10000.0;
@@ -271,14 +338,12 @@ pub(crate) fn fill_hyperbolic_plane(list: &mut DrawList, model: Model, color: Co
                 Vector3D::new(-big, big),
                 Vector3D::new(-big, bottom),
             ];
-            let r = list.solid_triangles(quad, color);
-            list.push_solid(r, false);
+            list.solid_triangles(quad, color)
         }
         _ => {
             let ring: Vec<Vector3D> =
                 (0..=250).map(|i| 2.0 * PI * i as f64 / 250.0).map(|a| Vector3D::new(a.cos(), a.sin())).collect();
-            let r = list.convex_fan(Vector3D::ORIGIN, &ring, color);
-            list.push_solid(r, false);
+            list.convex_fan(Vector3D::ORIGIN, &ring, color)
         }
     }
 }

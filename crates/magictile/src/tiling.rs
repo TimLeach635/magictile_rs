@@ -1,13 +1,14 @@
 //! Truncated hyperbolic tilings t{p,q}, navigable with the mouse like the puzzles.
 //!
 //! Truncating the regular {p,q} tiling cuts each vertex off: every p-gon becomes a 2p-gon and
-//! every vertex a q-gon. For t{4,5} (from the order-5 square tiling) that's red pentagons among
-//! yellow octagons, with blue lines where two octagons meet.
+//! every vertex a q-gon. For t{4,5} (from the order-5 square tiling) that's pentagons among
+//! octagons. Only the edges are drawn: red around the q-gons, blue where two 2p-gons meet, and
+//! everything outside the repeating unit is shaded.
 //!
 //! Usage: tiling [p q]   (default 4 5)
 
 use crate::cayley::{Cayley, MAX_Q, Perm};
-use crate::draw::{self, Camera, DrawList};
+use crate::draw::{self, Camera, Cmd, DrawList};
 use crate::render::{FrameJob, PuzzleCallback, Renderer};
 use crate::selftest::SelfTest;
 use crate::view::{Model, View};
@@ -19,12 +20,18 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 use web_time::Instant;
 
+/// The faces are left this color too, so only the edges are drawn.
 const BACKGROUND: Color32 = Color32::WHITE;
-const BIG_COLOR: Color32 = Color32::from_rgb(255, 255, 0);
-const SMALL_COLOR: Color32 = Color32::from_rgb(255, 0, 0);
-const LINE_COLOR: Color32 = Color32::from_rgb(0, 0, 255);
-/// Width of the lines between 2p-gons at the center of the Poincaré disk, in disk units.
+/// The edges between 2p-gons: in the Cayley graph, the transposition.
+const SWAP_COLOR: Color32 = Color32::from_rgb(0, 0, 255);
+/// The edges around q-gons: in the Cayley graph, the cycle (either way).
+const CYCLE_COLOR: Color32 = Color32::from_rgb(255, 0, 0);
+/// Laid over everything outside the repeating unit.
+const SHADE_COLOR: Color32 = Color32::from_black_alpha(51);
+/// Width of the edges at the center of the Poincaré disk, in disk units.
 const LINE_WIDTH: f64 = 0.0125;
+/// Points along each side of the repeating unit's outline.
+const UNIT_SIDE_POINTS: usize = 32;
 /// Faces smaller than this many pixels across aren't drawn.
 const MIN_FACE_PX: f64 = 0.6;
 /// Lines thinner than this many pixels aren't drawn.
@@ -44,13 +51,21 @@ const GEODESIC_COLOR: Color32 = Color32::from_rgb(0, 140, 70);
 /// The route through the graph, hop by hop.
 const PATH_COLOR: Color32 = Color32::from_rgb(255, 110, 0);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// A 2p-gon, from a tile of {p,q}.
+    Big,
+    /// A q-gon, around a vertex of {p,q}.
+    Small,
+}
+
 /// A face of the truncated tiling, in the Poincaré disk.
 struct Face {
+    kind: Kind,
     center: Vector3D,
     vertices: Vec<Vector3D>,
     /// The hyperbolic midpoint of the edge from each vertex to the next.
     midpoints: Vec<Vector3D>,
-    color: Color32,
     /// Hyperbolic distance from the center to the vertices.
     radius: f64,
 }
@@ -120,7 +135,7 @@ impl TruncatedTiling {
             let n = vs.len();
             let vertices =
                 (0..n).flat_map(|i| [towards(vs[i], vs[(i + 1) % n], d), towards(vs[(i + 1) % n], vs[i], d)]).collect();
-            faces.push(Face::new(tile.center(), vertices, BIG_COLOR));
+            faces.push(Face::new(Kind::Big, tile.center(), vertices));
         }
         // The q-gons, one per vertex with all its tiles present.
         for (&v, tiles) in tiling.vertex_incidences.iter() {
@@ -147,7 +162,7 @@ impl TruncatedTiling {
             // Order them around the vertex.
             let angle = |c: &Vector3D| to_origin(v.to_complex(), c.to_complex()).phase();
             corners.sort_by(|a, b| angle(a).total_cmp(&angle(b)));
-            faces.push(Face::new(v, corners, SMALL_COLOR));
+            faces.push(Face::new(Kind::Small, v, corners));
         }
 
         // The lines between 2p-gons: the middle parts of the original edges.
@@ -181,7 +196,7 @@ impl TruncatedTiling {
         // The q-gons' corners (counterclockwise) and the edges between 2p-gons are the two kinds
         // of step in the Cayley graph.
         let q_gons: Vec<(Vector3D, Vec<Vector3D>)> =
-            faces.iter().filter(|f| f.color == SMALL_COLOR).map(|f| (f.center, f.vertices.clone())).collect();
+            faces.iter().filter(|f| f.kind == Kind::Small).map(|f| (f.center, f.vertices.clone())).collect();
         let swaps: Vec<(Vector3D, Vector3D)> = lines.iter().map(|l| (l.a, l.b)).collect();
         // How far apart two vertices of one face can be. Every point lies in some face, and so
         // within this of each of that face's vertices, which is what lets the Cayley graph confirm
@@ -190,43 +205,41 @@ impl TruncatedTiling {
         let diameter = |f: &Face| {
             f.vertices.iter().flat_map(|&a| f.vertices.iter().map(move |&b| distance(a, b))).fold(0.0, f64::max)
         };
-        let central = |color: Color32| {
-            faces.iter().filter(|f| f.color == color).min_by(|a, b| a.center.abs().total_cmp(&b.center.abs()))
+        let central = |kind: Kind| {
+            faces.iter().filter(|f| f.kind == kind).min_by(|a, b| a.center.abs().total_cmp(&b.center.abs()))
         };
         let face_diameter =
-            [central(BIG_COLOR), central(SMALL_COLOR)].into_iter().flatten().map(diameter).fold(0.0, f64::max);
+            [central(Kind::Big), central(Kind::Small)].into_iter().flatten().map(diameter).fold(0.0, f64::max);
         let cayley = Cayley::build(p, q, &q_gons, &swaps, &start, face_diameter);
 
         Ok(TruncatedTiling { p, q, faces, lines, homes, start, short_edge_px, cayley })
     }
 
-    /// Builds the frame's draw list. Also returns a symmetry recentering the view (see
-    /// [`View::recenter`]), if the home tile has drifted away from the center.
+    /// Builds the frame's draw list: the edges, then a shade over the plane outside `unit` (a
+    /// closed outline in tiling coordinates), if given. Also returns a symmetry recentering the
+    /// view (see [`View::recenter`]), if the home tile has drifted away from the center.
     ///
-    /// Everything goes into two batched draws (faces, then lines), so the GPU sees a handful of
-    /// commands however many faces are visible.
-    fn draw(&self, view: &View, model: Model, pixels_per_point: f32) -> (DrawList, Option<Isometry>) {
+    /// The faces are left the background's white, so the edges all go into one batched draw, and
+    /// the GPU sees a handful of commands however many are visible.
+    fn draw(
+        &self,
+        view: &View,
+        model: Model,
+        pixels_per_point: f32,
+        unit: Option<&[Vector3D]>,
+    ) -> (DrawList, Option<Isometry>) {
         let camera = Camera::view(view.width, view.height, view.view_scale, view.rotation);
         let pixel = 2.0 * view.view_scale / (view.height as f64 * pixels_per_point as f64);
         let mut list = DrawList::new(BACKGROUND, camera, pixel);
-        // The far reaches of the tiling (beyond what we generate) are mostly 2p-gon.
-        draw::fill_hyperbolic_plane(&mut list, model, BIG_COLOR);
-
         let screen = Screen { model, pixel, short_edge_px: self.short_edge_px };
-        let start = list.solid.len() as u32;
         let mut scratch = Scratch::default();
-        for face in &self.faces {
-            if let Some(center) = face.ring(&view.isometry, &screen, &mut scratch) {
-                list.convex_fan(center, &scratch.ring, face.color);
-            }
-        }
-        list.push_solid(start..list.solid.len() as u32, false);
+        // Edges shrink with everything else towards the edge of the disk, the same for both kinds.
+        let width_at = |p: Vector3D| LINE_WIDTH * (1.0 - p.abs().powi(2)) / pixel;
 
         let start = list.solid.len() as u32;
         for line in &self.lines {
-            // Lines shrink with everything else towards the edge of the disk.
             let mid = view.isometry.apply(line.mid);
-            let width = LINE_WIDTH * (1.0 - mid.abs().powi(2)) / pixel;
+            let width = width_at(mid);
             if width < MIN_LINE_PX {
                 continue;
             }
@@ -234,9 +247,29 @@ impl TruncatedTiling {
             scratch.ring.clear();
             edge_points(a, b, || mid, &screen, &mut scratch.ring);
             scratch.ring.push(model.apply(b));
-            list.polyline_triangles(&scratch.ring, width, LINE_COLOR);
+            list.open_polyline_triangles(&scratch.ring, width, SWAP_COLOR);
+        }
+        // The q-gons' edges go on top, each q-gon's as one mitred outline, so that where they meet
+        // the square-cut ends of the swap edges, the joins are clean.
+        for face in self.faces.iter().filter(|f| f.kind == Kind::Small) {
+            let width = width_at(view.isometry.apply(face.center));
+            if width >= MIN_LINE_PX && face.ring(&view.isometry, &screen, &mut scratch).is_some() {
+                list.outline_triangles(&scratch.ring, width, CYCLE_COLOR);
+            }
         }
         list.push_solid(start..list.solid.len() as u32, false);
+
+        // Shade the plane outside the unit: an inverted fill of its outline, clipped to the plane
+        // so the background beyond the disk stays as it is.
+        if let Some(unit) = unit {
+            let ring: Vec<Vector3D> = unit.iter().map(|&p| model.apply(view.isometry.apply(p))).collect();
+            if ring.len() > 3 && ring.iter().all(|p| !p.is_dne()) {
+                let plane = draw::plane_triangles(&mut list, model, SHADE_COLOR);
+                list.cmds.push(Cmd::SetClip(plane));
+                list.fill(ring[0], &ring, true, SHADE_COLOR, true);
+                list.cmds.push(Cmd::ClearClip);
+            }
+        }
 
         // Without a labelling, any symmetry of the tiling will do to recenter; with one, the
         // viewer recenters itself with a symmetry that carries the labels (see `TilingApp`).
@@ -263,11 +296,11 @@ struct Scratch {
 }
 
 impl Face {
-    fn new(center: Vector3D, vertices: Vec<Vector3D>, color: Color32) -> Face {
+    fn new(kind: Kind, center: Vector3D, vertices: Vec<Vector3D>) -> Face {
         let radius = vertices.iter().map(|&v| distance(center, v)).fold(0.0, f64::max);
         let n = vertices.len();
         let midpoints = (0..n).map(|i| midpoint(vertices[i], vertices[(i + 1) % n])).collect();
-        Face { center, vertices, midpoints, color, radius }
+        Face { kind, center, vertices, midpoints, radius }
     }
 
     /// The face as it appears on screen: returns its center and leaves its closed boundary
@@ -509,7 +542,13 @@ impl TilingApp {
         self.view.navigate(ctx, &response, rect, model, self.gliding);
 
         let ppp = ctx.pixels_per_point();
-        let (list, recenter) = self.tiling.draw(&self.view, model, ppp);
+        let unit = self.unit_outline();
+        let mut ring: Vec<Vector3D> = unit.iter().flat_map(|side| &side[..side.len() - 1]).copied().collect();
+        if let Some(&first) = ring.first() {
+            ring.push(first);
+        }
+        let shaded = (!ring.is_empty()).then_some(ring.as_slice());
+        let (list, recenter) = self.tiling.draw(&self.view, model, ppp, shaded);
         self.view.recenter = recenter;
         let size_px = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         let job = FrameJob {
@@ -523,7 +562,7 @@ impl TilingApp {
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, PuzzleCallback { job: Arc::new(job) }));
 
         let painter = ui.painter().with_clip_rect(rect);
-        let found = self.overlay(&painter, rect, model, response.hover_pos());
+        let found = self.overlay(&painter, rect, model, response.hover_pos(), &unit);
         self.hovered = found.hovered;
         if response.clicked() {
             self.pick(found.hovered);
@@ -561,7 +600,39 @@ struct Found {
     center: Option<usize>,
 }
 
+/// Whether `p` lies inside the closed polygon `outline`.
+fn outline_contains(outline: &[Pos2], p: Pos2) -> bool {
+    let mut inside = false;
+    for (i, &a) in outline.iter().enumerate() {
+        let b = outline[(i + 1) % outline.len()];
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 impl TilingApp {
+    /// The outline of the copy of the repeating unit nearest the middle of the view, side by side
+    /// in tiling coordinates. The vertices showing the identity permutation mark the copies.
+    fn unit_outline(&self) -> Vec<Vec<Vector3D>> {
+        let Some(cayley) = &self.tiling.cayley else { return Vec::new() };
+        let showing_identity = cayley.inverse_of(&self.frame);
+        let from_middle = |v: usize| self.view.isometry.apply(cayley.vertices[v].pos).abs();
+        let Some(g) = cayley
+            .vertices_with_label(&showing_identity)
+            .iter()
+            .copied()
+            .min_by(|&a, &b| from_middle(a).total_cmp(&from_middle(b)))
+            .and_then(|v| cayley.frame_isometry(v))
+        else {
+            return Vec::new();
+        };
+        let corners: Vec<Vector3D> = cayley.unit.iter().map(|&c| g.apply(c)).collect();
+        let n = corners.len();
+        (0..n).map(|i| geodesic(corners[i], corners[(i + 1) % n], UNIT_SIDE_POINTS)).collect()
+    }
+
     /// Keeps the home vertex near the middle of the view: panning far otherwise loses precision
     /// and runs off the end of the generated patch. The symmetry used carries the labelling with
     /// it, so the permutations stay where they are on screen.
@@ -592,7 +663,15 @@ impl TilingApp {
     /// Draws the Cayley graph overlay over the tiling: the repeating unit as a dotted outline,
     /// the permutation at each vertex with room for it, and the hovered vertex together with its
     /// copies in the other units. Returns the hovered vertex.
-    fn overlay(&self, painter: &egui::Painter, rect: Rect, model: Model, pointer: Option<Pos2>) -> Found {
+    /// `unit` is the repeating unit's outline, side by side, from [`TilingApp::unit_outline`].
+    fn overlay(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        model: Model,
+        pointer: Option<Pos2>,
+        unit: &[Vec<Vector3D>],
+    ) -> Found {
         let Some(cayley) = self.tiling.cayley.as_ref() else { return Found::default() };
         let view = &self.view;
         let project = |p: Vector3D| -> Option<Pos2> {
@@ -622,30 +701,15 @@ impl TilingApp {
             }
         };
 
-        // The vertices showing the identity permutation mark the copies of the repeating unit;
-        // outline the one nearest the middle of the view.
+        // The repeating unit, as a dotted outline.
         let middle = rect.center();
-        let showing_identity = cayley.inverse_of(&self.frame);
-        let nearest_unit = cayley
-            .vertices_with_label(&showing_identity)
-            .iter()
-            .copied()
-            .min_by(|&a, &b| {
-                let from_middle = |v: usize| view.isometry.apply(cayley.vertices[v].pos).abs();
-                from_middle(a).total_cmp(&from_middle(b))
-            })
-            .and_then(|v| cayley.frame_isometry(v));
-        let mut unit: Vec<Vec<Pos2>> = Vec::new();
-        if let Some(g) = nearest_unit {
-            let corners: Vec<Vector3D> = cayley.unit.iter().map(|&c| g.apply(c)).collect();
-            for i in 0..corners.len() {
-                let side = geodesic(corners[i], corners[(i + 1) % corners.len()], 16);
-                let points: Vec<Pos2> = side.into_iter().filter_map(project).collect();
-                if points.len() > 1 {
-                    unit.push(points);
-                }
-            }
-        }
+        let sides: Vec<Vec<Pos2>> = unit.iter().map(|side| side.iter().copied().filter_map(project).collect()).collect();
+        // Where it is on screen, so labels outside it can be shaded as the tiling is there. If
+        // part of it can't be placed, nothing is shaded.
+        let whole = sides.iter().zip(unit).all(|(on_screen, side)| on_screen.len() == side.len());
+        let outline: Vec<Pos2> = if whole { sides.concat() } else { Vec::new() };
+        let outside = |p: Pos2| outline.len() > 2 && !outline_contains(&outline, p);
+        let unit: Vec<Vec<Pos2>> = sides.into_iter().filter(|side| side.len() > 1).collect();
         for side in &unit {
             painter.extend(egui::Shape::dashed_line(side, Stroke::new(1.5, UNIT_COLOR), 5.0, 4.0));
         }
@@ -740,6 +804,9 @@ impl TilingApp {
             };
             painter.rect_filled(backing, *size * 0.2, fill);
             painter.galley(*pos - galley.size() / 2.0, galley, text);
+            if outside(*pos) {
+                painter.rect_filled(backing, *size * 0.2, SHADE_COLOR);
+            }
         }
 
         // Markers last: a label's backing would otherwise hide which vertices were picked, and
@@ -934,9 +1001,9 @@ mod tests {
             let (min, max) = lengths.iter().fold((f64::MAX, 0.0f64), |(a, b), &l| (a.min(l), b.max(l)));
             assert!(max - min < 1e-9, "t{{{p},{q}}}: edge lengths range from {min} to {max}");
 
-            // Faces near the center are 2p-gons and q-gons in the right colors.
+            // Faces near the center are 2p-gons and q-gons of the right kinds.
             for f in t.faces.iter().filter(|f| f.center.abs() < 0.6) {
-                let expected = if f.color == BIG_COLOR { 2 * p } else { q };
+                let expected = if f.kind == Kind::Big { 2 * p } else { q };
                 assert_eq!(f.vertices.len(), expected as usize);
             }
         }
@@ -994,7 +1061,7 @@ mod tests {
     #[test]
     fn starts_centered_on_a_q_gon() {
         let t = TruncatedTiling::new(4, 5).unwrap();
-        let center = t.faces.iter().filter(|f| f.color == SMALL_COLOR).map(|f| t.start.apply(f.center).abs());
+        let center = t.faces.iter().filter(|f| f.kind == Kind::Small).map(|f| t.start.apply(f.center).abs());
         assert!(center.fold(f64::MAX, f64::min) < 1e-9);
     }
 }
